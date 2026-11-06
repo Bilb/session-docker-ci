@@ -33,9 +33,6 @@ parser.add_option('--retries', type="int", default=2,
                   help="Retry a failed docker build/push/manifest command this many times")
 parser.add_option('--retry-delay', type="int", default=60,
                   help="Seconds to wait before the first retry; doubles on each further retry")
-parser.add_option('--exclude', action="append", default=[], metavar="IMAGE",
-                  help="Skip images whose name starts with IMAGE (repeatable): e.g. android, clone, "
-                       "lint, debian-win32-cross")
 
 (options, args) = parser.parse_args()
 
@@ -72,9 +69,6 @@ def notify_crash(exc_type, exc, tb):
 sys.excepthook = notify_crash
 
 
-def excluded(name):
-    return any(name.startswith(x) for x in options.exclude)
-
 registry_base = 'reg.session.codes:80/'
 registry_insecure = True
 
@@ -98,8 +92,6 @@ if options.distro:
         print(f"Bad --distro value '{options.distro}'", file=sys.stderr)
         sys.exit(1)
     distros = [(d[0], d[1].split('/')[0])]
-
-distros = [d for d in distros if not excluded(d[0])]
 
 manifests = {}  # "image:latest": ["image/amd64", "image/arm64v8", ...]
 manifestlock = threading.Lock()
@@ -780,9 +772,7 @@ finish_jobs()
 if options.distro:
     jobs = []
 else:
-    singletons = {'clone': gitcache_clone, 'android': android_builds, 'lint': lint_build,
-                  'debian-win32-cross': debian_win32_cross}
-    jobs = [executor.submit(b) for name, b in singletons.items() if not excluded(name)]
+    jobs = [executor.submit(b) for b in (gitcache_clone, android_builds, lint_build, debian_win32_cross)]
 
 with jobs_lock:
     # We do some basic dependency handling here: we start off all the -base images right away, then
