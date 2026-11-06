@@ -161,14 +161,14 @@ def print_line(myline, value):
 
 def run_or_report(*args, myline, label, cwd=None):
     global failure
-    stdout = None if options.debug else subprocess.PIPE
+    stdout, stderr = (None, None) if options.debug else (subprocess.PIPE, subprocess.STDOUT)
     for attempt in range(options.retries + 1):
         if attempt:
             delay = options.retry_delay * 2 ** (attempt - 1)
             print_line(myline, f"\033[33;1mRetry in {delay:<6}s \033[35;1m{label}\033[0m")
             time.sleep(delay)
         try:
-            subprocess.run(args, check=True, stdout=stdout, stderr=stdout, encoding='utf8', cwd=cwd)
+            subprocess.run(args, check=True, stdout=stdout, stderr=stderr, encoding='utf8', cwd=cwd)
             return
         except subprocess.CalledProcessError as e:
             error = e
