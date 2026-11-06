@@ -34,8 +34,8 @@ parser.add_option('--retries', type="int", default=2,
 parser.add_option('--retry-delay', type="int", default=60,
                   help="Seconds to wait before the first retry; doubles on each further retry")
 parser.add_option('--exclude', action="append", default=[], metavar="IMAGE",
-                  help="Skip images whose name starts with IMAGE (repeatable): e.g. appium, "
-                       "playwright, android, clone, lint, debian-win32-cross")
+                  help="Skip images whose name starts with IMAGE (repeatable): e.g. android, clone, "
+                       "lint, debian-win32-cross")
 
 (options, args) = parser.parse_args()
 
@@ -78,8 +78,6 @@ def excluded(name):
 registry_base = 'reg.session.codes:80/'
 registry_insecure = True
 
-playwright_tag = 'playwright:v1.37.0'
-
 session_desktop_branches = ('dev', 'master')
 
 # Retries ride out transient mirror errors, such as a mirror caught mid-sync.
@@ -92,13 +90,11 @@ distros = [*(('debian', x) for x in ('sid', 'stable', 'testing', 'forky', 'trixi
            # Disabled: not currently used by CI (re-enable to build the
            # session-desktop-builder / session-desktop-playwright images).
            # *(('session-desktop-builder', x) for x in session_desktop_branches),
-           *((playwright_tag, x) for x in ('jammy', )),
-           *(('appium', x) for x in ('34', )),
            ]
 
 if options.distro:
     d = options.distro.rsplit('-', 1)
-    if len(d) != 2 or d[0] not in ('debian', 'ubuntu', playwright_tag, 'session-desktop-builder', 'appium') or not d[1]:
+    if len(d) != 2 or d[0] not in ('debian', 'ubuntu', 'session-desktop-builder') or not d[1]:
         print(f"Bad --distro value '{options.distro}'", file=sys.stderr)
         sys.exit(1)
     distros = [(d[0], d[1].split('/')[0])]
@@ -121,8 +117,6 @@ def arches(distro):
             sys.exit(1)
         return [arch[1]]
 
-    if distro[0] == playwright_tag or distro[0].startswith('appium'):
-        return ['amd64']
     if distro[0].startswith('session-desktop-builder'):
         return ['amd64']  # FIXME: we ought to be able to remove this and use the below
 
@@ -608,175 +602,6 @@ RUN {apt_get_quiet} install --no-install-recommends -y \
 
 
 
-def playwright_build(distro, arch):
-
-    playwright_version = f"{distro[0]}-{distro[1]}"
-    # looks like the push tag forbids ":" in it, so let's remove it
-    playwright_version_push = f"{playwright_version.replace(':','')}"
-    tag = f"{registry_base}{playwright_version_push}"
-    build_tag(tag, arch, f"""
-FROM mcr.microsoft.com/{playwright_version}
-RUN echo "man-db man-db/auto-update boolean false" | debconf-set-selections \
-    && {apt_get_quiet} remove -y --purge nodejs \
-    && rm -f /etc/apt/sources.list.d/nodesource.list \
-    && {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} install --no-install-recommends -y \
-        cmake \
-        build-essential \
-        time
-
-ENV NVM_DIR /usr/local/nvm
-ENV NODE_VERSION 24.12.0
-ENV SESSION_DESKTOP_ROOT /root/session-desktop
-ENV NODE_PATH $NVM_DIR/v$NODE_VERSION/lib/node_modules
-ENV CI 1
-RUN mkdir -p /usr/local/nvm \
-        && curl https://raw.githubusercontent.com/creationix/nvm/v0.39.5/install.sh | bash \
-        && . $NVM_DIR/nvm.sh \
-        && nvm install $NODE_VERSION \
-        && nvm alias default $NODE_VERSION \
-        && nvm use default \
-        && git config --global --add safe.directory $SESSION_DESKTOP_ROOT
-""")
-    check_done_build(tag)
-
-
-
-def appium_build(distro, arch):
-    tag = f"{registry_base}{distro[0]}-{distro[1]}"
-    android_arch = 'x86_64' if arch == 'amd64' else arch
-    target = 'google_apis_playstore'
-    api_level = f"android-{distro[1]}"
-    build_tool_v = f"{distro[1]}.0.0"
-    emu_pkg = f"system-images;{api_level};{target};{android_arch}"
-    android_pkgs = (
-            emu_pkg,
-            f"platforms;{api_level}",
-            f"build-tools;{build_tool_v}",
-            "platform-tools",
-            "emulator")
-
-    cmd_tools="commandlinetools-linux-11076708_latest.zip"
-
-    emulator_name = "emulator1"
-    emulators = [
-            # (docker tag name, android device name) -- e.g. ('A', 'B') builds emulator device 'B' in the appium-A registry image.
-            ('pixel6', 'pixel_6')
-    ]
-
-    # TODO: Doing this in each android-sdk touching RUN ought to make the build result repeatable,
-    # but sadly it does not.  Figure out why, because being able to save time here when the sdk
-    # hasn't changed would be a big saving in storage and download time.
-    #touch_sdk = "find $ANDROID_SDK_ROOT -mmin -30 -exec touch -d '2024-01-01 00:00:00 UTC' {} \\;"
-
-    # Split these up into separate RUN layers because docker can't parallelize layer upload,
-    # download, compression, or decompression, but can parallelize separate layers.
-    android_pkg_installs = "\n".join(f'RUN eatmydata sdkmanager --verbose "{p}"' for p in android_pkgs)
-
-    build_tag(tag + '-base', 'amd64', f"""
-FROM {registry_base}debian-stable-base
-
-ENV HOME=/root \
-    LANG=en_US.UTF-8 \
-    DEBIAN_FRONTEND=noninteractive \
-    LANGUAGE=en_US.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    DISPLAY=:0.0 \
-    DISPLAY_WIDTH=1920 \
-    DISPLAY_HEIGHT=900 \
-    ANDROID_SDK_ROOT=/opt/android \
-    DOCKER=true
-ENV PATH="$PATH:$ANDROID_SDK_ROOT/cmdline-tools/tools:$ANDROID_SDK_ROOT/cmdline-tools/tools/bin:$ANDROID_SDK_ROOT/emulator:$ANDROID_SDK_ROOT/tools/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/build-tools/{build_tool_v}"
-
-
-WORKDIR /
-
-SHELL ["/bin/bash", "-c"]
-
-# TODO: go through these to see which are actually needed for the build:
-RUN {apt_get_quiet} install -y eatmydata && \
-    {apt_get_quiet} install -y \
-        ca-certificates \
-        cpu-checker \
-        curl \
-        default-jdk-headless \
-        fluxbox \
-        git \
-        htop \
-        libarchive-tools \
-        libc++-dev \
-        libnss3 \
-        libpulse-dev \
-        libqt5gui5 \
-        libxcb-cursor0 \
-        libxcursor1 \
-        net-tools \
-        python3-pip \
-        python3-setuptools \
-        supervisor \
-        tree \
-        unzip \
-        vim \
-        wget \
-        x11vnc \
-        xterm \
-        xvfb
-
-
-#==========================
-# Install node & yarn berry
-#==========================
-
-RUN curl -sL https://deb.nodesource.com/setup_18.x | bash && \
-    eatmydata {apt_get_quiet} -y install nodejs && \
-    eatmydata npm install -g yarn && \
-    eatmydata corepack enable && \
-    yarn set version 4.1.1
-
-
-# Install websockify and noVNC
-# TODO: investigate whether the versions packaged in bookworm can be used
-RUN pip3 install --break-system-packages -U https://github.com/novnc/websockify/archive/refs/tags/v0.11.0.tar.gz
-RUN mkdir /usr/local/noVNC && \
-        curl -sSL https://github.com/x11vnc/noVNC/archive/refs/heads/x11vnc.zip \
-            | bsdtar xvf - --strip-components=1 -C /usr/local/noVNC && \
-            chmod a+x /usr/local/noVNC/utils/launch.sh
-
-
-
-#============================================
-# - Install required Android CMD-line tools
-# - update recent timestamps to make the layer more reproducible
-#============================================
-RUN mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/tools && \
-        curl -sSL https://dl.google.com/android/repository/{cmd_tools} \
-            | eatmydata bsdtar xvf - --strip-components=1 -C $ANDROID_SDK_ROOT/cmdline-tools/tools && \
-        chmod a+x $ANDROID_SDK_ROOT/cmdline-tools/tools/bin/*
-
-#============================================
-# - Install required package using SDK manager
-# - update recent timestamps to make the layer more reproducible
-#============================================
-RUN yes Y | sdkmanager --licenses
-{android_pkg_installs}
-
-
-""", manifest_now=True)
-
-    for emutag, device in emulators:
-        build_tag(f"{tag}-{emutag}", 'amd64', f"""
-FROM {tag}-base
-
-#============================================
-# Create required emulators
-#============================================
-
-RUN echo "no" | avdmanager --verbose create avd --force --name "{emulator_name}" --device "{device}" --package "{emu_pkg}"
-
-""", manifest_now=True)
-
-
 def debian_win32_cross():
     build_tag(f'{registry_base}debian-win32-cross', 'amd64', f"""
 FROM {registry_base}debian-stable-base/amd64
@@ -989,12 +814,6 @@ with jobs_lock:
         if d[0] == 'session-desktop-builder':
             build_func = session_desktop_builder
             dep_jobs[prefix] = [len(archlist), next_wave(session_desktop_playwright)]
-
-        elif d[0] == playwright_tag:
-            build_func = playwright_build
-
-        elif d[0] == 'appium':
-            build_func = appium_build
 
         else:
             build_func = distro_build_base
