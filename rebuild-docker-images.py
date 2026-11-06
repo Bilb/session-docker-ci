@@ -72,8 +72,6 @@ sys.excepthook = notify_crash
 registry_base = 'reg.session.codes:80/'
 registry_insecure = True
 
-session_desktop_branches = ('dev', 'master')
-
 # Retries ride out transient mirror errors, such as a mirror caught mid-sync.
 apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q'
 
@@ -81,14 +79,11 @@ apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q'
 distros = [*(('debian', x) for x in ('sid', 'stable', 'testing', 'forky', 'trixie', 'bookworm')),
            *(('ubuntu', x) for x in ('rolling', 'lts',
                'stonking', 'resolute', 'noble', 'jammy')),
-           # Disabled: not currently used by CI (re-enable to build the
-           # session-desktop-builder / session-desktop-playwright images).
-           # *(('session-desktop-builder', x) for x in session_desktop_branches),
            ]
 
 if options.distro:
     d = options.distro.rsplit('-', 1)
-    if len(d) != 2 or d[0] not in ('debian', 'ubuntu', 'session-desktop-builder') or not d[1]:
+    if len(d) != 2 or d[0] not in ('debian', 'ubuntu') or not d[1]:
         print(f"Bad --distro value '{options.distro}'", file=sys.stderr)
         sys.exit(1)
     distros = [(d[0], d[1].split('/')[0])]
@@ -108,10 +103,6 @@ def arches(distro):
             print(f"Bad --distro value '{options.distro}'", file=sys.stderr)
             sys.exit(1)
         return [arch[1]]
-
-    if distro[0].startswith('session-desktop-builder'):
-        return ['amd64']  # FIXME: we ought to be able to remove this and use the below
-
 
     a = ['amd64', 'arm64v8']
     if distro[0] == 'debian':
@@ -522,78 +513,6 @@ RUN {apt_get_quiet} install --no-install-recommends -y \
 """, manifest_now=True)
 
 
-def session_desktop_builder(distro, arch):
-    tag = f"{registry_base}{distro[0]}-{distro[1]}"
-
-    repo_base = f'https://raw.githubusercontent.com/session-foundation/session-desktop/{distro[1]}'
-    node_v = requests.get(f'{repo_base}/.nvmrc').content.decode().strip()
-
-    extra_pre, cmake = '', 'cmake'
-    if tuple(map(int, node_v.split('.'))) >= (18, 16):
-        basedist = 'bookworm'
-    else:
-        basedist = 'bullseye'
-        extra_pre = f"""echo "deb http://deb.debian.org/debian bullseye-backports main" >/etc/apt/sources.list.d/bullseye-backports.list &&"""
-        cmake = 'cmake/bullseye-backports'
-
-    build_tag(tag, arch, f"""
-FROM {platform(arch)} {arch}/node:{node_v}-{basedist}
-RUN /bin/bash -c 'echo "man-db man-db/auto-update boolean false" | debconf-set-selections'
-{'RUN dpkg --add-architecture i386' if arch == 'amd64' else ''}
-
-RUN {extra_pre} {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} install --no-install-recommends -y \
-        ccache \
-        {cmake} \
-        eatmydata \
-        g++ \
-        gdb \
-        git \
-        jq \
-        make \
-        ninja-build \
-        openssh-client \
-        patch \
-        pkg-config \
-        rpm \
-        wget \
-        {'wine32 wine' if arch == 'amd64' else ''} \
-    && mkdir /session-deps \
-    && cd /session-deps \
-    && wget {repo_base}/package.json \
-    && wget {repo_base}/pnpm-lock.yaml \
-    && wget {repo_base}/pnpm-workspace.yaml \
-    && export PNPM_HOME=/root/.local/share/pnpm \
-    && corepack enable \
-    && pnpm config set store-dir /root/.local/share/pnpm/store \
-    && pnpm fetch \
-""")
-    check_done_build(tag)
-
-
-def session_desktop_playwright(distro, arch):
-    # Builds on the above with extra stuff needed for playwright
-    tag = f"{registry_base}{distro[0].replace('builder', 'playwright')}-{distro[1]}"
-
-    build_tag(tag, arch, f"""
-FROM {registry_base}session-desktop-builder-{distro[1]}
-
-RUN {apt_get_quiet} install --no-install-recommends -y \
-        libasound2 \
-        libgbm1 \
-        libgtk-3-0 \
-        libnotify4 \
-        libnss3 \
-        libxss1 \
-        libxtst6 \
-        xauth \
-        xvfb
-""")
-    check_done_build(tag)
-
-
-
 def debian_win32_cross():
     build_tag(f'{registry_base}debian-win32-cross', 'amd64', f"""
 FROM {registry_base}debian-stable-base/amd64
@@ -801,20 +720,15 @@ with jobs_lock:
 
         prefix = f"{registry_base}{d[0]}-{d[1]}"
         dep_jobs[prefix] = [len(archlist)]
-        if d[0] == 'session-desktop-builder':
-            build_func = session_desktop_builder
-            dep_jobs[prefix] = [len(archlist), next_wave(session_desktop_playwright)]
-
-        else:
-            build_func = distro_build_base
-            dep_jobs[prefix + "-base"] = [len(archlist), next_wave(distro_build_builder)]
-            dep_jobs[prefix + "-builder"] = [len(archlist), next_wave(distro_build)]
-            if d == ('debian', 'stable') and 'amd64' in archlist:
-                dep_jobs[prefix].extend(next_singleton(f) for f in (debian_cross_build, build_docs))
-            if d == ('debian', 'sid') and 'amd64' in archlist:
-                dep_jobs[prefix].append(next_singleton(debian_clang_build))
-            if d == ('debian', 'forky') and 'amd64' in archlist:
-                dep_jobs[prefix + "-base"].append(next_singleton(debian_s390x_cross))
+        build_func = distro_build_base
+        dep_jobs[prefix + "-base"] = [len(archlist), next_wave(distro_build_builder)]
+        dep_jobs[prefix + "-builder"] = [len(archlist), next_wave(distro_build)]
+        if d == ('debian', 'stable') and 'amd64' in archlist:
+            dep_jobs[prefix].extend(next_singleton(f) for f in (debian_cross_build, build_docs))
+        if d == ('debian', 'sid') and 'amd64' in archlist:
+            dep_jobs[prefix].append(next_singleton(debian_clang_build))
+        if d == ('debian', 'forky') and 'amd64' in archlist:
+            dep_jobs[prefix + "-base"].append(next_singleton(debian_s390x_cross))
 
         for a in archlist:
             jobs.append(executor.submit(build_func, d, a))
