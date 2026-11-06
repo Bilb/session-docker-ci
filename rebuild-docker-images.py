@@ -4,10 +4,15 @@ import subprocess
 import tempfile
 import optparse
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, CancelledError
 import threading
 import requests
 import shutil
+import os
+import time
+import fcntl
+import socket
+import traceback
 
 parser = optparse.OptionParser()
 parser.add_option("--no-cache", action="store_true",
@@ -22,9 +27,53 @@ parser.add_option('--no-push', action="store_true",
 parser.add_option('--debug', action="store_true",
                   help="print docker build status to stdout; implies -j1")
 parser.add_option('--keep-going', action="store_true",
-                  help="Don't stop after an image build failure")
+                  help="Don't stop after an image build failure; images depending on a failed one are "
+                       "still skipped")
+parser.add_option('--retries', type="int", default=2,
+                  help="Retry a failed docker build/push/manifest command this many times")
+parser.add_option('--retry-delay', type="int", default=60,
+                  help="Seconds to wait before the first retry; doubles on each further retry")
+parser.add_option('--exclude', action="append", default=[], metavar="IMAGE",
+                  help="Skip images whose name starts with IMAGE (repeatable): e.g. appium, "
+                       "playwright, android, clone, lint, debian-win32-cross")
 
 (options, args) = parser.parse_args()
+
+# Relative paths below (session-foundation.gpg, clone-scripts/) must not depend on where we're run from.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# Two runs (a timer and a manual one, say) pushing the same tags and manifests break each other.
+lockfile = open('.rebuild.lock', 'w')
+try:
+    fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("Another rebuild-docker-images.py run holds .rebuild.lock; not starting", file=sys.stderr)
+    sys.exit(75)
+
+
+def notify_discord(message):
+    """Posts to the Discord webhook in $DISCORD_WEBHOOK_URL, if set."""
+    url = os.environ.get('DISCORD_WEBHOOK_URL')
+    if not url:
+        return
+    try:
+        requests.post(url, json={"content": message[:2000]}, timeout=30).raise_for_status()
+    except Exception as e:
+        print(f"Discord notification failed: {e}", file=sys.stderr)
+
+
+def notify_crash(exc_type, exc, tb):
+    if not issubclass(exc_type, KeyboardInterrupt):
+        trace = ''.join(traceback.format_exception(exc_type, exc, tb))[-1800:]
+        notify_discord(f"**Session CI image rebuild crashed on {socket.gethostname()}**\n```\n{trace}\n```")
+    sys.__excepthook__(exc_type, exc, tb)
+
+
+sys.excepthook = notify_crash
+
+
+def excluded(name):
+    return any(name.startswith(x) for x in options.exclude)
 
 registry_base = 'reg.session.codes:80/'
 registry_insecure = True
@@ -33,7 +82,8 @@ playwright_tag = 'playwright:v1.37.0'
 
 session_desktop_branches = ('dev', 'master')
 
-apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -q'
+# Retries ride out transient mirror errors, such as a mirror caught mid-sync.
+apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q'
 
 
 distros = [*(('debian', x) for x in ('sid', 'stable', 'testing', 'forky', 'trixie', 'bookworm')),
@@ -52,6 +102,8 @@ if options.distro:
         print(f"Bad --distro value '{options.distro}'", file=sys.stderr)
         sys.exit(1)
     distros = [(d[0], d[1].split('/')[0])]
+
+distros = [d for d in distros if not excluded(d[0])]
 
 manifests = {}  # "image:latest": ["image/amd64", "image/arm64v8", ...]
 manifestlock = threading.Lock()
@@ -88,6 +140,8 @@ hacks = {
 
 
 failure = False
+failures = []  # (what failed, its log file or None)
+failures_lock = threading.Lock()
 
 lineno = 0
 linelock = threading.Lock()
@@ -105,27 +159,38 @@ def print_line(myline, value):
     linelock.release()
 
 
-def run_or_report(*args, myline, cwd=None):
-    stdout, stderr = (None, None) if options.debug else (subprocess.PIPE, subprocess.STDOUT)
-    try:
-        subprocess.run(
-            args, check=True, stdout=stdout, stderr=stdout, encoding='utf8', cwd=cwd)
-    except subprocess.CalledProcessError as e:
-        global failure
-        failure = True
-        if options.debug:
-            print_line(myline, f"\033[31;1mError! See debug log output for details")
-        else:
-            with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as log:
-                log.write(f"Error running {' '.join(args)}: {e}\n\nOutput:\n\n".encode())
-                log.write(e.output.encode())
-                print_line(myline, f"\033[31;1mError! See {log.name} for details")
-        if not options.keep_going:
-            raise e
+def run_or_report(*args, myline, label, cwd=None):
+    global failure
+    stdout = None if options.debug else subprocess.PIPE
+    for attempt in range(options.retries + 1):
+        if attempt:
+            delay = options.retry_delay * 2 ** (attempt - 1)
+            print_line(myline, f"\033[33;1mRetry in {delay:<6}s \033[35;1m{label}\033[0m")
+            time.sleep(delay)
+        try:
+            subprocess.run(args, check=True, stdout=stdout, stderr=stdout, encoding='utf8', cwd=cwd)
+            return
+        except subprocess.CalledProcessError as e:
+            error = e
+
+    failure = True
+    logname = None
+    if options.debug:
+        print_line(myline, f"\033[31;1mError! See debug log output for details")
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as log:
+            log.write(f"Error running {' '.join(args)} ({options.retries + 1} attempts): {error}\n\n"
+                      "Output of the last attempt:\n\n".encode())
+            log.write(error.output.encode())
+            logname = log.name
+        print_line(myline, f"\033[31;1mError! See {logname} for details")
+    with failures_lock:
+        failures.append((label, logname))
+    raise error
 
 
 def build_tag(tag_base, arch, contents, *, manifest_now=False, prebuild_callback=None):
-    if failure:
+    if failure and not options.keep_going:
         raise ChildProcessError()
 
     linelock.acquire()
@@ -145,12 +210,13 @@ def build_tag(tag_base, arch, contents, *, manifest_now=False, prebuild_callback
         tag = f'{tag_base}/{arch}'
         print_line(myline,     f"\033[33;1mRebuilding        \033[35;1m{tag}\033[0m")
         run_or_report('docker', 'build', '--pull', '-t', tag,
-                      *(('--no-cache',) if options.no_cache else ()), '.', myline=myline, cwd=dockerdir)
+                      *(('--no-cache',) if options.no_cache else ()), '.',
+                      myline=myline, label=f"build {tag}", cwd=dockerdir)
         if options.no_push:
             print_line(myline, f"\033[33;1mSkip Push         \033[35;1m{tag}\033[0m")
         else:
             print_line(myline, f"\033[33;1mPushing           \033[35;1m{tag}\033[0m")
-            run_or_report('docker', 'push', tag, myline=myline)
+            run_or_report('docker', 'push', tag, myline=myline, label=f"push {tag}")
 
         print_line(myline,     f"\033[32;1mFinished build    \033[35;1m{tag}\033[0m")
 
@@ -810,7 +876,7 @@ def push_manifest(image):
     if options.no_push:
         return
 
-    if failure:
+    if failure and not options.keep_going:
         raise ChildProcessError()
 
     latest = image + ':latest'
@@ -826,14 +892,18 @@ def push_manifest(image):
 
     subprocess.run(['docker', 'manifest', 'rm', latest], stderr=subprocess.DEVNULL, check=False)
     print_line(myline, f"\033[33;1mCreating manifest \033[35;1m{latest}\033[0m")
-    run_or_report('docker', 'manifest', 'create', *manifest_extra, latest, *tags, myline=myline)
+    # --amend so that a retry can reuse a local list a failed attempt already wrote.
+    run_or_report('docker', 'manifest', 'create', '--amend', *manifest_extra, latest, *tags,
+                  myline=myline, label=f"manifest create {latest}")
     print_line(myline, f"\033[33;1mPushing manifest  \033[35;1m{latest}\033[0m")
-    run_or_report('docker', 'manifest', 'push', *manifest_extra, latest, myline=myline)
+    run_or_report('docker', 'manifest', 'push', *manifest_extra, latest,
+                  myline=myline, label=f"manifest push {latest}")
     print_line(myline, f"\033[32;1mFinished manifest \033[35;1m{latest}\033[0m")
 
 
 
 def finish_jobs():
+    global failure
     while True:
         with jobs_lock:
             if not jobs:
@@ -842,12 +912,31 @@ def finish_jobs():
 
         try:
             j.result()
-        except (ChildProcessError, subprocess.CalledProcessError):
-            with jobs_lock:
-                failure = True
-                dep_jobs.clear()
-                for k in jobs:
-                    k.cancel()
+        except (ChildProcessError, CancelledError):
+            pass  # skipped because of an earlier failure, which is already recorded
+        except Exception as e:
+            failure = True
+            if not isinstance(e, subprocess.CalledProcessError):  # those record themselves
+                with failures_lock:
+                    failures.append((f"{type(e).__name__}: {e}", None))
+            if not options.keep_going:
+                with jobs_lock:
+                    dep_jobs.clear()
+                    for k in jobs:
+                        k.cancel()
+
+
+def failure_report():
+    header = [f"**Session CI image rebuild on {socket.gethostname()}: {len(failures)} failure(s)**"]
+    header += [f"- `{what}`" + (f" (log: `{log}`)" if log else "") for what, log in failures]
+    header = "\n".join(header)
+    first_log = next((log for _, log in failures if log), None)
+    if not first_log:
+        return header
+    with open(first_log, errors='replace') as f:
+        tail = "\n".join(f.read().splitlines()[-25:])
+    budget = 1900 - len(header)
+    return header if budget < 200 else f"{header}\n```\n{tail[-budget:]}\n```"
 
 
 executor = ThreadPoolExecutor(max_workers=1 if options.debug else max(options.parallel, 1))
@@ -866,7 +955,9 @@ finish_jobs()
 if options.distro:
     jobs = []
 else:
-    jobs = [executor.submit(b) for b in (gitcache_clone, android_builds, lint_build, debian_win32_cross)]
+    singletons = {'clone': gitcache_clone, 'android': android_builds, 'lint': lint_build,
+                  'debian-win32-cross': debian_win32_cross}
+    jobs = [executor.submit(b) for name, b in singletons.items() if not excluded(name)]
 
 with jobs_lock:
     # We do some basic dependency handling here: we start off all the -base images right away, then
@@ -922,7 +1013,10 @@ with jobs_lock:
 finish_jobs()
 
 if failure:
-    print("Error(s) occured, aborting!", file=sys.stderr)
+    print("\n\033[31;1mFailed:\033[0m", file=sys.stderr)
+    for what, log in failures:
+        print(f"  {what}" + (f"  (log: {log})" if log else ""), file=sys.stderr)
+    notify_discord(failure_report())
     sys.exit(1)
 
 
