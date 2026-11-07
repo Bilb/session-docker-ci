@@ -1,45 +1,59 @@
 #!/usr/bin/env python3
+"""
+Rebuilds the Session CI images from ./Dockerfile with `docker buildx bake`, and pushes them.
 
-import subprocess
-import tempfile
-import optparse
-import sys
-from concurrent.futures import ThreadPoolExecutor, CancelledError
-import threading
-import requests
-import shutil
-import os
-import time
+Each distro is one bake run, building its -base, -builder and final images on every arch plus the
+images built on top of them (sid-clang, android, lint...).  Distros run in parallel and fail
+independently, and a failed one is retried.  An image is only rebuilt when its distro's apt archives
+have changed since the cached build (see archive_state), so a nightly run is cheap where nothing
+moved and fresh where something did.
+"""
+
 import fcntl
+import hashlib
+import json
+import optparse
+import os
 import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
 
 parser = optparse.OptionParser()
-parser.add_option("--no-cache", action="store_true",
-                  help="Run `docker build` with the `--no-cache` option to ignore existing images")
-parser.add_option("--parallel", "-j", type="int", default=1,
-                  help="Run up to this many builds in parallel")
-parser.add_option("--distro", "-d", type="string", default="",
-                  help="Build only this distro; should be DISTRO-CODE or DISTRO-CODE/ARCH, "
-                       "e.g. debian-sid/amd64")
-parser.add_option('--no-push', action="store_true",
-                  help="push built images to docker repository")
-parser.add_option('--debug', action="store_true",
-                  help="print docker build status to stdout; implies -j1")
-parser.add_option('--keep-going', action="store_true",
-                  help="Don't stop after an image build failure; images depending on a failed one are "
-                       "still skipped")
-parser.add_option('--retries', type="int", default=2,
-                  help="Retry a failed docker build/push/manifest command this many times")
-parser.add_option('--retry-delay', type="int", default=60,
-                  help="Seconds to wait before the first retry; doubles on each further retry")
-
+parser.add_option("--registry", default="reg.session.codes:80",
+                  help="Registry to push to [default: %default]")
+parser.add_option("--registry-https", action="store_true",
+                  help="The registry speaks HTTPS (by default it is plain HTTP, as ours is over the VPN)")
+parser.add_option("--builder", default="session-ci",
+                  help="buildx builder to use, created on first use [default: %default]")
+parser.add_option("--cache-size", type="int", default=100,
+                  help="GB of build cache the builder keeps, when it creates it [default: %default]")
+parser.add_option("--distro", "-d", action="append", default=[],
+                  help="Only build this distro, e.g. debian-sid (repeatable)")
+parser.add_option("--arch", default="",
+                  help="Only build these arches, comma separated: amd64,i386,arm64v8,arm32v7")
+parser.add_option("--parallel", "-j", type="int", default=3,
+                  help="Build this many distros at once [default: %default]")
+parser.add_option("--retries", type="int", default=2,
+                  help="Retry a failed distro this many times [default: %default]")
+parser.add_option("--retry-delay", type="int", default=60,
+                  help="Seconds before the first retry; doubles on each further retry [default: %default]")
+parser.add_option("--no-push", action="store_true", help="Build only, keeping the result in the build cache")
+parser.add_option("--no-cache", action="store_true", help="Ignore the build cache")
+parser.add_option("--print", action="store_true", dest="print_only",
+                  help="Print the bake definitions and exit")
 (options, args) = parser.parse_args()
 
-# Relative paths below (session-foundation.gpg, clone-scripts/) must not depend on where we're run from.
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+here = os.path.dirname(os.path.abspath(__file__))
+os.chdir(here)
 
-# Two runs (a timer and a manual one, say) pushing the same tags and manifests break each other.
+# Two runs (a timer and a manual one, say) pushing the same tags break each other.
 lockfile = open('.rebuild.lock', 'w')
 try:
     fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -68,679 +82,271 @@ def notify_crash(exc_type, exc, tb):
 
 sys.excepthook = notify_crash
 
-
-registry_base = 'reg.session.codes:80/'
-registry_insecure = True
-
-# Retries ride out transient mirror errors, such as a mirror caught mid-sync.
-apt_get_quiet = 'apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q'
+printlock = threading.Lock()
+started = time.time()
 
 
-distros = [*(('debian', x) for x in ('sid', 'stable', 'testing', 'forky', 'trixie', 'bookworm')),
-           *(('ubuntu', x) for x in ('rolling', 'lts',
-               'stonking', 'resolute', 'noble', 'jammy')),
-           ]
-
-if options.distro:
-    d = options.distro.rsplit('-', 1)
-    if len(d) != 2 or d[0] not in ('debian', 'ubuntu') or not d[1]:
-        print(f"Bad --distro value '{options.distro}'", file=sys.stderr)
-        sys.exit(1)
-    distros = [(d[0], d[1].split('/')[0])]
-
-manifests = {}  # "image:latest": ["image/amd64", "image/arm64v8", ...]
-manifestlock = threading.Lock()
-
-dep_jobs = {}  # image => [remaining_jobs, queue_dep_jobs_callbacks...]
-cancel_jobs = False
-jobs_lock = threading.Lock()
+def say(message):
+    with printlock:
+        print(f"[{time.time() - started:6.0f}s] {message}", flush=True)
 
 
-def arches(distro):
-    if options.distro and '/' in options.distro:
-        arch = options.distro.split('/')
-        if arch[1] not in ('amd64', 'i386', 'arm64v8', 'arm32v7'):
-            print(f"Bad --distro value '{options.distro}'", file=sys.stderr)
-            sys.exit(1)
-        return [arch[1]]
+PLATFORMS = {'amd64': 'linux/amd64', 'i386': 'linux/386', 'arm64v8': 'linux/arm64', 'arm32v7': 'linux/arm/v7'}
+DEBIAN_ARCHES = ['amd64', 'arm64v8', 'i386', 'arm32v7']
+UBUNTU_ARCHES = ['amd64', 'arm64v8']
 
-    a = ['amd64', 'arm64v8']
-    if distro[0] == 'debian':
-        a.append('i386')
-        a.append('arm32v7')
-    return a
+# name: (upstream image, deb.session.foundation suite, arches).  @SUITE@: see the Dockerfile.
+DISTROS = {
+    'debian-sid': ('debian:sid', 'sid', DEBIAN_ARCHES),
+    'debian-stable': ('debian:stable', 'stable', DEBIAN_ARCHES),
+    'debian-testing': ('debian:testing', 'testing', DEBIAN_ARCHES),
+    'debian-forky': ('debian:forky', 'forky', DEBIAN_ARCHES),
+    'debian-trixie': ('debian:trixie', 'trixie', DEBIAN_ARCHES),
+    'debian-bookworm': ('debian:bookworm', 'bookworm', DEBIAN_ARCHES),
+    'ubuntu-rolling': ('ubuntu:rolling', '@SUITE@', UBUNTU_ARCHES),
+    'ubuntu-lts': ('ubuntu:latest', '@SUITE@', UBUNTU_ARCHES),
+    'ubuntu-stonking': ('ubuntu:stonking', 'stonking', UBUNTU_ARCHES),
+    'ubuntu-resolute': ('ubuntu:resolute', 'resolute', UBUNTU_ARCHES),
+    'ubuntu-noble': ('ubuntu:noble', 'noble', UBUNTU_ARCHES),
+    'ubuntu-jammy': ('ubuntu:jammy', 'jammy', UBUNTU_ARCHES),
+}
 
-
-hacks = {
-#    registry_base + 'debian-example': "pkg1 pkg2 && mkdir -p /o/m/g"
+# Images built on a distro's stages, after its own images: distro => units, each unit a list of
+# (image, Dockerfile stage, arches) built together and failing together.  bake cancels the rest of a
+# run when one target fails, so each unit has its own run, and a broken one costs only itself.
+EXTRAS = {
+    'debian-sid': [[('debian-sid-clang', 'sid-clang', ['amd64'])],
+                   [('android', 'android', ['amd64']), ('flutter', 'flutter', ['amd64'])]],
+    'debian-stable': [[('debian-win32-cross', 'win32-cross', ['amd64'])],
+                      [('debian-stable-cross', 'stable-cross', ['amd64'])],
+                      [('docbuilder', 'docbuilder', ['amd64'])]],
+    'debian-forky': [[('debian-forky-s390x-cross', 's390x-cross', ['amd64'])]],
+    'debian-bookworm': [[('lint', 'lint', ['amd64'])],
+                        [('clone', 'clone', ['amd64', 'arm64v8'])]],
 }
 
 
-failure = False
-failures = []  # (what failed, its log file or None)
-failures_lock = threading.Lock()
-
-lineno = 0
-linelock = threading.Lock()
-
-
-def print_line(myline, value):
-    linelock.acquire()
-    global lineno
-    if sys.__stdout__.isatty() and not options.debug:
-        jump = lineno - myline
-        print(f"\033[{jump}A\r\033[K{value}\033[{jump}B\r", end='')
-        sys.stdout.flush()
+def packages_fingerprint(url):
+    """The Packages checksums an InRelease file lists, or a marker for an archive that doesn't exist."""
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=30)
+            break
+        except requests.RequestException as e:
+            error = e
+            time.sleep(5)
     else:
-        print(value)
-    linelock.release()
+        raise RuntimeError(f"{url}: {error}")
+    if r.status_code == 404:
+        return f"{url} absent"
+    r.raise_for_status()
+    # Only the checksums of the Packages indexes: an InRelease re-signed with a new Date or
+    # Valid-Until but nothing new in it must not count as a change.
+    lines, in_sha256 = [], False
+    for line in r.text.splitlines():
+        if not line.startswith(' '):
+            in_sha256 = line.startswith('SHA256:')
+        elif in_sha256 and 'Packages' in line:
+            lines.append(line.strip())
+    return url + "\n" + "\n".join(lines)
 
 
-def run_or_report(*args, myline, label, cwd=None):
-    global failure
-    stdout, stderr = (None, None) if options.debug else (subprocess.PIPE, subprocess.STDOUT)
+def codename(distro):
+    image, suite, _ = DISTROS[distro]
+    if suite != '@SUITE@':
+        return suite
+    out = subprocess.run(['docker', 'run', '--rm', '--pull', 'always', image, 'sh', '-c',
+                          '. /etc/os-release && echo "$VERSION_CODENAME"'],
+                         check=True, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def archive_state(distro):
+    """
+    A fingerprint of every apt archive the distro's images install from, used as the APT_STATE
+    build argument: it changes exactly when there is something new to install.
+    """
+    c = codename(distro)
+    if distro.startswith('debian-'):
+        urls = [f"http://deb.debian.org/debian/dists/{c}/InRelease"]
+        if c != 'sid':
+            urls += [f"http://deb.debian.org/debian/dists/{c}-updates/InRelease",
+                     f"http://security.debian.org/debian-security/dists/{c}-security/InRelease"]
+    else:
+        urls = [f"{base}/dists/{c}{pocket}/InRelease"
+                for base in ("http://archive.ubuntu.com/ubuntu", "http://ports.ubuntu.com/ubuntu-ports")
+                for pocket in ("", "-updates", "-security")]
+    urls.append(f"https://deb.session.foundation/dists/{c}/InRelease")
+    digest = hashlib.sha256()
+    for url in urls:
+        digest.update(packages_fingerprint(url).encode())
+    return digest.hexdigest()[:16]
+
+
+def image_targets(name, stage, arches, args):
+    """
+    bake targets for one image: X/<arch> for each arch, which CI also uses directly, and the
+    multi-arch X.  They share every layer, so BuildKit builds each only once.
+    """
+    common = {"context": ".", "dockerfile": "Dockerfile", "target": stage, "args": args, "pull": True}
+    repo = f"{options.registry}/{name}"
+    targets = {f"{name}-{a}": {**common, "platforms": [PLATFORMS[a]], "tags": [f"{repo}/{a}"]}
+               for a in arches}
+    if len(arches) == 1:
+        targets[f"{name}-{arches[0]}"]["tags"].append(repo)
+    else:
+        targets[name] = {**common, "platforms": [PLATFORMS[a] for a in arches], "tags": [repo]}
+    return targets
+
+
+def bake_units(distro, arches, state):
+    """The distro's bake definitions, in build order: its own images, then each extra unit."""
+    image, suite, _ = DISTROS[distro]
+    args = {"DISTRO_IMAGE": image, "SESSION_SUITE": suite, "APT_STATE": state}
+    units = [(distro, [(distro + suffix, stage, arches)
+                       for suffix, stage in (('-base', 'base'), ('-builder', 'builder'), ('', 'final'))])]
+    for unit in EXTRAS.get(distro, []):
+        unit = [(name, stage, [a for a in unit_arches if a in arches]) for name, stage, unit_arches in unit]
+        if all(unit_arches for _, _, unit_arches in unit):
+            units.append((unit[0][0], unit))
+    definitions = []
+    for name, images in units:
+        targets = {}
+        for image_name, stage, image_arches in images:
+            targets.update(image_targets(image_name, stage, image_arches, args))
+        definitions.append((name, {"group": {"default": {"targets": list(targets)}}, "target": targets}))
+    return definitions
+
+
+def ensure_builder(rundir):
+    """Creates the builder if it doesn't exist; returns the platforms it can build."""
+    if subprocess.run(['docker', 'buildx', 'inspect', options.builder], capture_output=True).returncode != 0:
+        config = os.path.join(rundir, 'buildkitd.toml')
+        with open(config, 'w') as f:
+            # Explicit, because BuildKit's defaults are shares of the disk: on a mostly full disk it
+            # evicts the cache after every build, and then every run rebuilds everything.
+            f.write(f'[worker.oci]\n  maxUsedSpace = "{options.cache_size}GB"\n'
+                    f'  reservedSpace = "{options.cache_size // 2}GB"\n  minFreeSpace = "10GB"\n')
+            if not options.registry_https:
+                f.write(f'[registry."{options.registry}"]\n  http = true\n  insecure = true\n')
+        # network=host so that a registry on localhost is the host's, not the builder container's.
+        subprocess.run(['docker', 'buildx', 'create', '--name', options.builder, '--driver', 'docker-container',
+                        '--driver-opt', 'network=host', '--buildkitd-config', config], check=True)
+    out = subprocess.run(['docker', 'buildx', 'inspect', '--bootstrap', options.builder],
+                         check=True, capture_output=True, text=True).stdout
+    return {p.strip() for line in out.splitlines() if line.strip().startswith('Platforms:')
+            for p in line.split(':', 1)[1].split(',')}
+
+
+# Without buildx's default provenance attestations, which add "unknown/unknown" platform entries to
+# every pushed image list and that some clients list as an extra platform.
+bake_env = {**os.environ, 'BUILDX_NO_DEFAULT_ATTESTATIONS': '1'}
+
+
+def run_bake(name, definition, rundir):
+    """Runs one bake, with retries.  Returns None on success, else its log."""
+    bakefile = os.path.join(rundir, f"{name}.bake.json")
+    with open(bakefile, 'w') as f:
+        json.dump(definition, f, indent=2)
+    log = os.path.join(rundir, f"{name}.log")
+    cmd = ['docker', 'buildx', 'bake', '--builder', options.builder, '--file', bakefile, '--progress', 'plain',
+           *(['--set', '*.output=type=cacheonly'] if options.no_push else ['--push']),
+           *(['--no-cache'] if options.no_cache else [])]
+    began = time.time()
     for attempt in range(options.retries + 1):
         if attempt:
             delay = options.retry_delay * 2 ** (attempt - 1)
-            print_line(myline, f"\033[33;1mRetry in {delay:<6}s \033[35;1m{label}\033[0m")
+            say(f"{name}: failed, retrying in {delay}s (see {log})")
             time.sleep(delay)
-        try:
-            subprocess.run(args, check=True, stdout=stdout, stderr=stderr, encoding='utf8', cwd=cwd)
-            return
-        except subprocess.CalledProcessError as e:
-            error = e
-
-    failure = True
-    logname = None
-    if options.debug:
-        print_line(myline, f"\033[31;1mError! See debug log output for details")
-    else:
-        with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as log:
-            log.write(f"Error running {' '.join(args)} ({options.retries + 1} attempts): {error}\n\n"
-                      "Output of the last attempt:\n\n".encode())
-            log.write(error.output.encode())
-            logname = log.name
-        print_line(myline, f"\033[31;1mError! See {logname} for details")
-    with failures_lock:
-        failures.append((label, logname))
-    raise error
-
-
-def build_tag(tag_base, arch, contents, *, manifest_now=False, prebuild_callback=None):
-    if failure and not options.keep_going:
-        raise ChildProcessError()
-
-    linelock.acquire()
-    global lineno
-    myline = lineno
-    lineno += 1
-    print()
-    linelock.release()
-
-    with tempfile.TemporaryDirectory(dir='.') as dockerdir:
-        with open(dockerdir + '/Dockerfile', 'w') as f:
-            f.write(contents)
-
-        if prebuild_callback:
-            prebuild_callback(dockerdir)
-
-        tag = f'{tag_base}/{arch}'
-        print_line(myline,     f"\033[33;1mRebuilding        \033[35;1m{tag}\033[0m")
-        run_or_report('docker', 'build', '--pull', '-t', tag,
-                      *(('--no-cache',) if options.no_cache else ()), '.',
-                      myline=myline, label=f"build {tag}", cwd=dockerdir)
-        if options.no_push:
-            print_line(myline, f"\033[33;1mSkip Push         \033[35;1m{tag}\033[0m")
-        else:
-            print_line(myline, f"\033[33;1mPushing           \033[35;1m{tag}\033[0m")
-            run_or_report('docker', 'push', tag, myline=myline, label=f"push {tag}")
-
-        print_line(myline,     f"\033[32;1mFinished build    \033[35;1m{tag}\033[0m")
-
-        latest = tag_base + ':latest'
-        global manifests
-        with manifestlock:
-            if latest in manifests:
-                manifests[latest].append(tag)
-            else:
-                manifests[latest] = [tag]
-
-        if manifest_now:
-            push_manifest(tag_base)
-
-
-def check_done_build(tag):
-    """
-    Check if we're done build all the arch builds for 'tag' and if so, push the manifest and then
-    start dependent jobs (if any).
-    """
-    done, depjobs = False, []
-    with jobs_lock:
-        if tag not in dep_jobs:
-            done = True
-        else:
-            deps = dep_jobs[tag]
-            assert deps[0] > 0
-            deps[0] -= 1
-            if deps[0] == 0:
-                done = True
-                depjobs = deps[1:]
-
-    if done:
-        push_manifest(tag)
-
-        if depjobs:
-            for q in depjobs:
-                q()
-
-
-def platform(arch):
-    if arch == 'arm64v8':
-        return '--platform=linux/arm64/v8'
-    if arch == 'arm32v7':
-        return '--platform=linux/arm/v7'
-    if arch == 'i386':
-        return '--platform=linux/386'
-    return ''
-
-
-def distro_build_base(distro, arch, *, initial_debian=False):
-    skip_build = not initial_debian and (distro, arch) in [
-            (('debian', 'stable'), 'amd64'),
-            (('debian', 'bookworm'), 'amd64'),
-            (('debian', 'sid'), 'amd64')]
-
-    tag = f'{registry_base}{distro[0]}-{distro[1]}-base'
-    codename = 'latest' if distro == ('ubuntu', 'lts') else distro[1]
-    if not skip_build:
-        build_tag(tag, arch, f"""
-FROM {platform(arch)} {arch}/{distro[0]}:{codename}
-RUN /bin/bash -c 'echo "man-db man-db/auto-update boolean false" | debconf-set-selections'
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} autoremove -y
-""", manifest_now=initial_debian)
-
-    if not initial_debian:
-        check_done_build(tag)
-
-
-def distro_build_builder(distro, arch):
-    """
-    (distro)-(codename)-builder: Deb builder image used for building debs; we add the basic tools we
-    use to build debs, not including things that should come from the dependencies in the
-    debian/control file.
-    """
-    base = f'{registry_base}{distro[0]}-{distro[1]}-base'
-    tag = f'{registry_base}{distro[0]}-{distro[1]}-builder'
-    build_tag(tag, arch, f"""
-FROM {base}/{arch}
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} --no-install-recommends install -y \
-        ccache \
-        devscripts \
-        equivs \
-        g++ \
-        git \
-        git-buildpackage \
-        openssh-client \
-        {hacks.get(tag, '')}
-""")
-
-    check_done_build(tag)
-
-
-def distro_build(distro, arch):
-    """
-    (distro)-(codename): Basic image we use for most builds.  This takes the -builder and adds most
-    dependencies found in our packages.
-    """
-    builder = f'{registry_base}{distro[0]}-{distro[1]}-builder'
-    tag = f'{registry_base}{distro[0]}-{distro[1]}'
-
-    # ubuntu's lts/rolling are moving aliases rather than suites our apt repo publishes, so we
-    # leave a placeholder for the image to fill in with its own codename at build time.  (debian's
-    # testing/stable need no such thing: the repo publishes suite symlinks for those.)
-    #
-    # /etc/os-release rather than lsb_release because lsb-release isn't installed in the -builder
-    # image and can't be, given apt-get update is what fails while the suite is unresolved.  Not
-    # applicable to debian, where sid's os-release reports the current *testing* codename.
-    if distro[1] in ('lts', 'rolling'):
-        suite = '@SUITE@'
-        resolve_suite = (
-            'RUN . /etc/os-release && test -n "$VERSION_CODENAME"'
-            ' && sed -i "s/@SUITE@/$VERSION_CODENAME/" /etc/apt/sources.list.d/session.sources')
-    else:
-        suite, resolve_suite = distro[1], ''
-
-    def copy_repo_files(dockerdir):
-        shutil.copy('session-foundation.gpg', dockerdir)
-        with open(dockerdir + '/session.sources', 'w') as f:
-            f.write(f"""Types: deb
-URIs: https://deb.session.foundation
-Suites: {suite}
-Components: main
-Signed-By: /usr/share/keyrings/session-foundation.gpg
-""")
-
-    build_tag(tag, arch, f"""
-FROM {builder}/{arch}
-COPY session-foundation.gpg /usr/share/keyrings/session-foundation.gpg
-COPY session.sources /etc/apt/sources.list.d/session.sources
-{resolve_suite}
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} --no-install-recommends install -y \
-        automake \
-        ccache \
-        cmake \
-        curl \
-        eatmydata \
-        g++ \
-        gdb \
-        git \
-        libboost-program-options-dev \
-        libboost-serialization-dev \
-        libboost-thread-dev \
-        libcurl4-gnutls-dev \
-        libevent-dev \
-        libfmt-dev \
-        libgnutls28-dev \
-        libgtest-dev \
-        libhidapi-dev \
-        libjemalloc-dev \
-        libminiupnpc-dev \
-        libngtcp2-crypto-gnutls-dev \
-        libngtcp2-dev \
-        liboxenc-dev \
-        liboxen-quic-dev \
-        libprotobuf-dev \
-        libreadline-dev \
-        libsodium-dev \
-        libspdlog-dev \
-        libsqlite3-dev \
-        libssl-dev \
-        libsystemd-dev \
-        libtool \
-        libunbound-dev \
-        libunwind8-dev \
-        libusb-1.0.0-dev \
-        libutf8proc-dev \
-        libuv1-dev \
-        libzmq3-dev \
-        libzstd-dev \
-        lsb-release \
-        make \
-        meson \
-        nettle-dev \
-        ninja-build \
-        openssh-client \
-        patch \
-        pkg-config \
-        postgresql-client \
-        pybind11-dev \
-        python3-coloredlogs \
-        python3-cryptography \
-        python3-dev \
-        python3-flask \
-        python3-nacl \
-        python3-openssl \
-        python3-pil \
-        python3-pip \
-        python3-protobuf \
-        python3-psycopg2 \
-        python3-pybind11 \
-        python3-pycryptodome \
-        python3-pytest \
-        python3-qrencode \
-        python3-setuptools \
-        python3-sqlalchemy \
-        python3-sqlalchemy-utils \
-        python3-tabulate \
-        python3-uwsgidecorators \
-        qttools5-dev \
-        sqlite3 \
-        {hacks.get(tag, '')}
-""",
-        prebuild_callback=copy_repo_files)
-
-    check_done_build(tag)
-
-
-def gitcache_clone():
-    tag = f'{registry_base}clone'
-    def copy_clone_scripts(dockerdir):
-        shutil.copytree('clone-scripts', dockerdir + '/clone-scripts')
-
-    for arch in ('amd64', 'arm64v8'):
-        build_tag(tag, arch, f"""
-FROM {platform(arch)} {arch}/debian:bookworm-slim
-RUN /bin/bash -c 'echo "man-db man-db/auto-update boolean false" | debconf-set-selections'
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} install -y --no-install-recommends git git-lfs python3 python3-pip python3-portalocker python3-pytimeparse python3-coloredlogs bash \
-    && pip3 install --break-system-packages https://github.com/seeraven/gitcache/releases/download/v1.0.22/gitcache-1.0.22-py3-none-any.whl \
-    && ln -s gitcache /usr/local/bin/git \
-    && {apt_get_quiet} remove --autoremove --purge -y python3-pip \
-    && {apt_get_quiet} clean \
-    && rm -rf /var/cache/apt/lists/*
-ADD clone-scripts/* /usr/local/bin/
-ENTRYPOINT ["/usr/local/bin/clone"]
-""",
-        prebuild_callback=copy_clone_scripts)
-
-    push_manifest(tag)
-
-
-def debian_clang_build():
-    """For debian-sid/amd64 we also build an extra one with clang+llvm"""
-
-    tag = f'{registry_base}debian-sid-clang'
-    def clang(suffix=''):
-        """clang/lld/llvm package names, optionally with a '-NN' version suffix"""
-        return ' '.join(pkg + suffix for pkg in ('clang', 'lld', 'llvm'))
-    build_tag(tag, 'amd64', f"""
-FROM {registry_base}debian-sid/amd64
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} --no-install-recommends install -y \
-        {clang()} \
-        {clang('-18')} \
-        {clang('-19')} \
-        {clang('-21')} \
-        {clang('-22')} \
-        libc++-dev \
-        libc++abi-dev
-""", manifest_now=True)
-
-
-# Android and flutter builds on top of debian-sid-base and adds a ton of android crap; we
-# schedule this job as soon as the debian-sid-base/amd64 build finishes, because they easily take
-# the longest and are by far the biggest images.
-def android_builds():
-    build_tag(registry_base + 'android', 'amd64', f"""
-FROM {registry_base}debian-sid-base
-RUN /bin/bash -c 'sed -i "s/main/main non-free/g" /etc/apt/sources.list.d/debian.sources'
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} install --no-install-recommends -y \
-        android-sdk \
-        automake \
-        ccache \
-        cmake \
-        curl \
-        git \
-        google-android-ndk-r29-installer \
-        libtool \
-        make \
-        ninja-build \
-        openjdk-21-jdk \
-        openssh-client \
-        patch \
-        pkg-config \
-        python3 \
-        wget \
-        xz-utils \
-        zip \
-    && update-java-alternatives -s java-1.21.0-openjdk-amd64 \
-    && git clone https://github.com/Shadowstyler/android-sdk-licenses.git /tmp/android-sdk-licenses \
-    && cp -a /tmp/android-sdk-licenses/*-license /usr/lib/android-sdk/licenses \
-    && rm -rf /tmp/android-sdk-licenses
-""", manifest_now=True)
-
-    build_tag(registry_base + 'flutter', 'amd64', f"""
-FROM {registry_base}android
-RUN cd /opt \
-    && curl https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.7.8-stable.tar.xz \
-        | tar xJv --no-same-owner \
-    && ln -s /opt/flutter/bin/flutter /usr/local/bin/ \
-    && flutter upgrade --force && flutter precache
-""", manifest_now=True)
-
-
-# lint is a tiny build (on top of debian-bookworm-base) with just formatting checking tools
-def lint_build():
-    build_tag(registry_base + 'lint', 'amd64', f"""
-FROM {registry_base}debian-bookworm-base
-RUN {apt_get_quiet} install --no-install-recommends -y \
-    clang-format-14 \
-    clang-format-15 \
-    clang-format-16 \
-    clang-format-19 \
-    eatmydata \
-    git \
-    jsonnet
-""", manifest_now=True)
-
-
-def debian_win32_cross():
-    build_tag(f'{registry_base}debian-win32-cross', 'amd64', f"""
-FROM {registry_base}debian-stable-base/amd64
-RUN {apt_get_quiet} install --no-install-recommends -y \
-        autoconf \
-        automake \
-        build-essential \
-        ca-certificates \
-        ccache \
-        cmake \
-        eatmydata \
-        file \
-        g++-mingw-w64-x86-64 \
-        git \
-        gperf \
-        libtool \
-        make \
-        ninja-build \
-        nsis \
-        openssh-client \
-        patch \
-        pkg-config \
-        qttools5-dev \
-        wine \
-        zip \
-    && update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix \
-    && update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
-""", manifest_now=True)
-
-
-def debian_cross_build():
-    """ build debian cross compiler image """
-    tag = f'{registry_base}debian-stable-cross'
-    compilers = ' '.join(f'g++-{a} gcc-{a}' for a in (
-        'aarch64-linux-gnu', 'arm-linux-gnueabihf', 'mips-linux-gnu', 'mips64-linux-gnuabi64',
-        'mipsel-linux-gnu', 'powerpc64le-linux-gnu'))
-
-    build_tag(tag, 'amd64', f"""
-FROM {registry_base}debian-stable/amd64
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} install -y {compilers}
-""", manifest_now=True)
-
-
-def debian_s390x_cross():
-    """
-    s390x cross compiler image with s390x dev libs and qemu-user to run what it builds: s390x is the
-    big-endian target we test on.  forky rather than testing so that this doesn't move when forky
-    releases.  No session.foundation repo: it publishes nothing for s390x.
-    """
-    tag = f'{registry_base}debian-forky-s390x-cross'
-    libs = ' '.join(f'{pkg}:s390x' for pkg in (
-        'libevent-dev', 'libfmt-dev', 'libgnutls28-dev', 'libngtcp2-crypto-gnutls-dev',
-        'libngtcp2-dev', 'libprotobuf-dev', 'libsimdutf-dev', 'libsodium-dev', 'libspdlog-dev',
-        'libsqlite3-dev', 'libutf8proc-dev', 'libzstd-dev', 'nettle-dev', 'pkgconf'))
-
-    build_tag(tag, 'amd64', f"""
-FROM {registry_base}debian-forky-base/amd64
-RUN dpkg --add-architecture s390x \
-    && {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} --no-install-recommends install -y \
-        automake \
-        build-essential \
-        ca-certificates \
-        ccache \
-        cmake \
-        crossbuild-essential-s390x \
-        eatmydata \
-        file \
-        git \
-        libcli11-dev \
-        libtool \
-        make \
-        ninja-build \
-        nlohmann-json3-dev \
-        patch \
-        pkg-config \
-        qemu-user \
-        {libs}
-""", manifest_now=True)
-
-
-def build_docs():
-    """ documentation builder image """
-
-    build_tag(f'{registry_base}docbuilder', 'amd64', f"""
-FROM {registry_base}debian-stable/amd64
-RUN {apt_get_quiet} update \
-    && {apt_get_quiet} dist-upgrade -y \
-    && {apt_get_quiet} install -y doxygen mkdocs curl zip unzip tar
-""", manifest_now=True)
-
-
-def push_manifest(image):
-    if options.no_push:
-        return
-
-    if failure and not options.keep_going:
-        raise ChildProcessError()
-
-    latest = image + ':latest'
-    with manifestlock:
-        tags = list(manifests[latest])
-    with linelock:
-        global lineno
-        myline = lineno
-        lineno += 1
-        print()
-
-    manifest_extra = ['--insecure'] if registry_insecure else []
-
-    subprocess.run(['docker', 'manifest', 'rm', latest], stderr=subprocess.DEVNULL, check=False)
-    print_line(myline, f"\033[33;1mCreating manifest \033[35;1m{latest}\033[0m")
-    # --amend so that a retry can reuse a local list a failed attempt already wrote.
-    run_or_report('docker', 'manifest', 'create', '--amend', *manifest_extra, latest, *tags,
-                  myline=myline, label=f"manifest create {latest}")
-    print_line(myline, f"\033[33;1mPushing manifest  \033[35;1m{latest}\033[0m")
-    run_or_report('docker', 'manifest', 'push', *manifest_extra, latest,
-                  myline=myline, label=f"manifest push {latest}")
-    print_line(myline, f"\033[32;1mFinished manifest \033[35;1m{latest}\033[0m")
-
-
-
-def finish_jobs():
-    global failure
-    while True:
-        with jobs_lock:
-            if not jobs:
-                break
-            j = jobs.pop(0)
-
-        try:
-            j.result()
-        except (ChildProcessError, CancelledError):
-            pass  # skipped because of an earlier failure, which is already recorded
-        except Exception as e:
-            failure = True
-            if not isinstance(e, subprocess.CalledProcessError):  # those record themselves
-                with failures_lock:
-                    failures.append((f"{type(e).__name__}: {e}", None))
-            if not options.keep_going:
-                with jobs_lock:
-                    dep_jobs.clear()
-                    for k in jobs:
-                        k.cancel()
-
-
-def failure_report():
-    header = [f"**Session CI image rebuild on {socket.gethostname()}: {len(failures)} failure(s)**"]
-    header += [f"- `{what}`" + (f" (log: `{log}`)" if log else "") for what, log in failures]
-    header = "\n".join(header)
+        say(f"{name}: building {len(definition['target'])} targets" + (f", attempt {attempt + 1}" if attempt else ""))
+        with open(log, 'a') as f:
+            f.write(f"\n=== attempt {attempt + 1}: {' '.join(cmd)}\n")
+            f.flush()
+            if subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=bake_env).returncode == 0:
+                say(f"{name}: done in {time.time() - began:.0f}s")
+                return None
+    say(f"{name}: FAILED after {options.retries + 1} attempts, see {log}")
+    return log
+
+
+def build_distro(distro, arches, rundir):
+    """Builds a distro's images, then each of its extra units.  Returns its failures as (what, log)."""
+    try:
+        state = archive_state(distro)
+    except Exception as e:
+        # Unknown archives: rebuild rather than risk serving stale images.
+        state = f"unknown-{time.time():.0f}"
+        say(f"{distro}: archive state unavailable ({e}); rebuilding")
+    say(f"{distro}: apt state {state}")
+    (name, definition), *extras = bake_units(distro, arches, state)
+    log = run_bake(name, definition, rundir)
+    if log:
+        return [(distro, log)] + [(f"{extra} (skipped: it builds on {distro})", None) for extra, _ in extras]
+    return [(extra, log) for extra, definition in extras if (log := run_bake(extra, definition, rundir))]
+
+
+def failure_report(failures):
+    header = "\n".join([f"**Session CI image rebuild on {socket.gethostname()}: {len(failures)} failure(s)**"]
+                       + [f"- `{what}`" + (f" (log: `{log}`)" if log else "") for what, log in failures])
     first_log = next((log for _, log in failures if log), None)
     if not first_log:
         return header
     with open(first_log, errors='replace') as f:
-        tail = "\n".join(f.read().splitlines()[-25:])
+        lines = f.read().splitlines()
+    # BuildKit's own summary of what failed, else the end of the log.
+    errors = [l for l in lines if l.startswith('ERROR') or ' ERROR: ' in l] or lines[-25:]
+    tail = "\n".join(errors[-25:])
     budget = 1900 - len(header)
     return header if budget < 200 else f"{header}\n```\n{tail[-budget:]}\n```"
 
 
-executor = ThreadPoolExecutor(max_workers=1 if options.debug else max(options.parallel, 1))
-jobs = []
+def main():
+    unknown = [d for d in options.distro if d not in DISTROS]
+    if unknown:
+        parser.error(f"unknown distro(s) {', '.join(unknown)}; known: {', '.join(DISTROS)}")
+    wanted_arches = [a for a in options.arch.split(',') if a] or list(PLATFORMS)
+    if not set(wanted_arches) <= set(PLATFORMS):
+        parser.error(f"--arch takes {', '.join(PLATFORMS)}")
+    distros = options.distro or list(DISTROS)
+    rundir = tempfile.mkdtemp(prefix=f"session-docker-ci-{time.strftime('%Y%m%dT%H%M%S')}-")
+
+    failures = []
+    if options.print_only:
+        supported = set(PLATFORMS.values())
+    else:
+        supported = ensure_builder(rundir)
+        missing = [a for a in wanted_arches if PLATFORMS[a] not in supported]
+        if missing:
+            # Never skipped silently: a builder that lost its ARM node would otherwise stop
+            # refreshing those images without anyone noticing.
+            failures.append((f"builder {options.builder} cannot build {', '.join(missing)}; "
+                             "add a node for them (see the README) or pass --arch", None))
+            wanted_arches = [a for a in wanted_arches if a not in missing]
+
+    plans = {d: [a for a in DISTROS[d][2] if a in wanted_arches] for d in distros}
+    plans = {d: arches for d, arches in plans.items() if arches}
+
+    if options.print_only:
+        for d, arches in plans.items():
+            for name, definition in bake_units(d, arches, "<apt state>"):
+                print(f"# {name}")
+                print(json.dumps(definition, indent=2))
+        return 0
+
+    say(f"building {len(plans)} distro(s) for {', '.join(wanted_arches)}; logs in {rundir}")
+    with ThreadPoolExecutor(max_workers=max(options.parallel, 1)) as executor:
+        results = {d: executor.submit(build_distro, d, arches, rundir) for d, arches in plans.items()}
+    for future in results.values():
+        failures += future.result()
+
+    if failures:
+        print("\nFailed:", file=sys.stderr)
+        for what, log in failures:
+            print(f"  {what}" + (f"  (log: {log})" if log else ""), file=sys.stderr)
+        notify_discord(failure_report(failures))
+        return 1
+    say("all done")
+    return 0
 
 
-# Start some debian base builds on their own, because other builds depend on them and we want to get
-# those (especially android/flutter) fired off as soon as possible (because it's slow and huge).
-with jobs_lock:
-    for base in (('debian', 'stable'), ('debian', 'bookworm'), ('debian', 'sid')):
-        if base in distros:
-            jobs.append(executor.submit(distro_build_base, base, 'amd64', initial_debian=True))
-
-finish_jobs()
-
-if options.distro:
-    jobs = []
-else:
-    jobs = [executor.submit(b) for b in (gitcache_clone, android_builds, lint_build, debian_win32_cross)]
-
-with jobs_lock:
-    # We do some basic dependency handling here: we start off all the -base images right away, then
-    # schedule -builder to follow once -base is done on *all* arches (and the manifest pushed), then
-    # the unsuffixed once -builder is done on all arches with manifest pushed.
-    #
-    # Docker sucks balls, though, so if anything goes wrong you'll just get some useless error about
-    # the manifest not existing (you also sometimes just get that randomly as a failure as well,
-    # because docker).
-
-    for d in distros:
-        archlist = arches(d)
-        def next_wave(build_func):
-            dist = d
-            arches = archlist
-            def f():
-                with jobs_lock:
-                    for a in arches:
-                        jobs.append(executor.submit(build_func, dist, a))
-            return f
-        def next_singleton(build_func):
-            def f():
-                with jobs_lock:
-                    jobs.append(executor.submit(build_func))
-            return f
-
-        prefix = f"{registry_base}{d[0]}-{d[1]}"
-        dep_jobs[prefix] = [len(archlist)]
-        build_func = distro_build_base
-        dep_jobs[prefix + "-base"] = [len(archlist), next_wave(distro_build_builder)]
-        dep_jobs[prefix + "-builder"] = [len(archlist), next_wave(distro_build)]
-        if d == ('debian', 'stable') and 'amd64' in archlist:
-            dep_jobs[prefix].extend(next_singleton(f) for f in (debian_cross_build, build_docs))
-        if d == ('debian', 'sid') and 'amd64' in archlist:
-            dep_jobs[prefix].append(next_singleton(debian_clang_build))
-        if d == ('debian', 'forky') and 'amd64' in archlist:
-            dep_jobs[prefix + "-base"].append(next_singleton(debian_s390x_cross))
-
-        for a in archlist:
-            jobs.append(executor.submit(build_func, d, a))
-
-finish_jobs()
-
-if failure:
-    print("\n\033[31;1mFailed:\033[0m", file=sys.stderr)
-    for what, log in failures:
-        print(f"  {what}" + (f"  (log: {log})" if log else ""), file=sys.stderr)
-    notify_discord(failure_report())
-    sys.exit(1)
-
-
-print("\n\n\033[32;1mAll done!\n")
+sys.exit(main())
