@@ -120,16 +120,18 @@ RUN $APT update \
         sqlite3
 
 
-# debian-sid-clang: debian-sid with several clang/llvm releases.
+# debian-sid-clang: debian-sid with every clang/llvm release sid ships, oldest to newest.  Taken
+# from apt rather than listed, because sid drops old releases without notice.
 FROM final AS sid-clang
 ARG APT
 RUN $APT update \
     && $APT dist-upgrade -y \
+    && versions=$(apt-cache pkgnames clang- | sed -n 's/^clang-\([0-9][0-9]*\)$/\1/p' | sort -n) \
+    && test -n "$versions" \
+    && echo "clang releases:" $versions \
     && $APT --no-install-recommends install -y \
         clang lld llvm \
-        clang-19 lld-19 llvm-19 \
-        clang-21 lld-21 llvm-21 \
-        clang-22 lld-22 llvm-22 \
+        $(for v in $versions; do echo "clang-$v lld-$v llvm-$v"; done) \
         libc++-dev \
         libc++abi-dev
 
