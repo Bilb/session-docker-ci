@@ -120,18 +120,13 @@ RUN $APT update \
         sqlite3
 
 
-# debian-sid-clang: debian-sid with several clang/llvm releases, including sid's oldest, which is
-# taken from apt rather than named because sid drops old releases without notice.
+# debian-sid-clang: debian-sid with several clang/llvm releases.
 FROM final AS sid-clang
 ARG APT
 RUN $APT update \
     && $APT dist-upgrade -y \
-    && oldest=$(apt-cache pkgnames clang- | sed -n 's/^clang-\([0-9][0-9]*\)$/\1/p' | sort -n | head -1) \
-    && test -n "$oldest" \
-    && echo "oldest clang release: $oldest" \
     && $APT --no-install-recommends install -y \
         clang lld llvm \
-        clang-$oldest lld-$oldest llvm-$oldest \
         clang-19 lld-19 llvm-19 \
         clang-21 lld-21 llvm-21 \
         clang-22 lld-22 llvm-22 \
@@ -173,7 +168,7 @@ RUN $APT update \
 FROM android AS flutter
 RUN cd /opt \
     && curl https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.7.8-stable.tar.xz \
-        | tar xJ --no-same-owner \
+        | tar xJv --no-same-owner \
     && ln -s /opt/flutter/bin/flutter /usr/local/bin/ \
     && flutter upgrade --force && flutter precache
 
@@ -297,5 +292,5 @@ RUN echo "apt archive state: ${APT_STATE}" \
     && $APT remove --autoremove --purge -y python3-pip \
     && $APT clean \
     && rm -rf /var/cache/apt/lists/*
-COPY clone-scripts/ /usr/local/bin/
+ADD clone-scripts/* /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/clone"]
