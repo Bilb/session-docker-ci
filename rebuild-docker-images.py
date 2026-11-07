@@ -35,7 +35,10 @@ parser.add_option("--builder", default="session-ci",
 parser.add_option("--cache-size", type="int", default=100,
                   help="GB of build cache the builder keeps, when it creates it [default: %default]")
 parser.add_option("--distro", "-d", action="append", default=[],
-                  help="Only build this distro, e.g. debian-sid (repeatable)")
+                  help="Only build this distro, e.g. debian-sid, or one arch of it, e.g. debian-sid/amd64 "
+                       "(repeatable)")
+parser.add_option("--debug", action="store_true",
+                  help="Show the build output instead of writing it to log files; implies -j1")
 parser.add_option("--arch", default="",
                   help="Only build these arches, comma separated: amd64,i386,arm64v8,arm32v7")
 parser.add_option("--parallel", "-j", type="int", default=3,
@@ -250,7 +253,8 @@ def run_bake(name, definition, rundir):
         json.dump(definition, f, indent=2)
     log = os.path.join(rundir, f"{name}.log")
     cmd = ['docker', 'buildx', 'bake', '--builder', options.builder, '--file', bakefile, '--progress', 'plain',
-           *(['--set', '*.output=type=cacheonly'] if options.no_push else ['--push']),
+           # Docker's v2 manifest formats rather than OCI's, as the registry has always served.
+           '--set', '*.output=type=cacheonly' if options.no_push else '*.output=type=registry,oci-mediatypes=false',
            *(['--no-cache'] if options.no_cache else [])]
     began = time.time()
     for attempt in range(options.retries + 1):
@@ -259,12 +263,20 @@ def run_bake(name, definition, rundir):
             say(f"{name}: failed, retrying in {delay}s (see {log})")
             time.sleep(delay)
         say(f"{name}: building {len(definition['target'])} targets" + (f", attempt {attempt + 1}" if attempt else ""))
+        if options.debug:
+            if subprocess.run(cmd, env=bake_env).returncode == 0:
+                say(f"{name}: done in {time.time() - began:.0f}s")
+                return None
+            continue
         with open(log, 'a') as f:
             f.write(f"\n=== attempt {attempt + 1}: {' '.join(cmd)}\n")
             f.flush()
             if subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=bake_env).returncode == 0:
                 say(f"{name}: done in {time.time() - began:.0f}s")
                 return None
+    if options.debug:
+        say(f"{name}: FAILED after {options.retries + 1} attempts, see the output above")
+        return "(the output above)"
     say(f"{name}: FAILED after {options.retries + 1} attempts, see {log}")
     return log
 
@@ -301,13 +313,16 @@ def failure_report(failures):
 
 
 def main():
-    unknown = [d for d in options.distro if d not in DISTROS]
-    if unknown:
-        parser.error(f"unknown distro(s) {', '.join(unknown)}; known: {', '.join(DISTROS)}")
+    requested = {}  # distro => arches asked for with --distro
+    for d in options.distro:
+        name, _, arch = d.partition('/')
+        if name not in DISTROS or (arch and arch not in PLATFORMS):
+            parser.error(f"bad --distro {d!r}; distros: {', '.join(DISTROS)}; arches: {', '.join(PLATFORMS)}")
+        requested.setdefault(name, set()).update([arch] if arch else PLATFORMS)
     wanted_arches = [a for a in options.arch.split(',') if a] or list(PLATFORMS)
     if not set(wanted_arches) <= set(PLATFORMS):
         parser.error(f"--arch takes {', '.join(PLATFORMS)}")
-    distros = options.distro or list(DISTROS)
+    distros = list(requested) or list(DISTROS)
     rundir = tempfile.mkdtemp(prefix=f"session-docker-ci-{time.strftime('%Y%m%dT%H%M%S')}-")
 
     failures = []
@@ -323,7 +338,8 @@ def main():
                              "add a node for them (see the README) or pass --arch", None))
             wanted_arches = [a for a in wanted_arches if a not in missing]
 
-    plans = {d: [a for a in DISTROS[d][2] if a in wanted_arches] for d in distros}
+    plans = {d: [a for a in DISTROS[d][2] if a in wanted_arches and a in requested.get(d, PLATFORMS)]
+             for d in distros}
     plans = {d: arches for d, arches in plans.items() if arches}
 
     if options.print_only:
@@ -334,7 +350,7 @@ def main():
         return 0
 
     say(f"building {len(plans)} distro(s) for {', '.join(wanted_arches)}; logs in {rundir}")
-    with ThreadPoolExecutor(max_workers=max(options.parallel, 1)) as executor:
+    with ThreadPoolExecutor(max_workers=1 if options.debug else max(options.parallel, 1)) as executor:
         results = {d: executor.submit(build_distro, d, arches, rundir) for d, arches in plans.items()}
     for future in results.values():
         failures += future.result()
