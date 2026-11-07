@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # Every Session CI image, as stages of one Dockerfile.  rebuild-docker-images.py builds them with
 # `docker buildx bake`, choosing the stage, platform and distro through build arguments.
 

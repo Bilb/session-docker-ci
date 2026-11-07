@@ -23,7 +23,8 @@ fingerprint of the Packages indexes of every apt archive its distro installs fro
 distros come straight from the build cache.  `--no-cache` rebuilds everything.
 
 `./rebuild-docker-images.py --print` shows the bake definitions; `--distro debian-sid` and
-`--arch amd64,i386` narrow a run.
+`--arch amd64,i386` narrow a run.  A run that doesn't build every arch of an image pushes only its
+`IMAGE/ARCH` tags and leaves the multi-arch `IMAGE` as it is, since ARM pipelines pull that too.
 
 ### The builder
 
@@ -36,8 +37,8 @@ binfmt-support`), or, much faster, a native ARM machine added as a node:
         --buildkitd-config buildkitd.toml ssh://user@arm-host
 
 where `buildkitd.toml` holds the same `[registry."reg.session.codes:80"] http = true` section the
-script writes.  A run fails, rather than skipping them, when the builder can't build a requested
-arch.
+script writes.  Each node pushes its own images, so the ARM host needs the VPN too.  When the
+builder can't build a requested arch, the run builds the others and reports a failure.
 
 ### Nightly rebuilds
 
@@ -55,5 +56,7 @@ to the registry:
 4. `systemctl daemon-reload && systemctl enable --now session-docker-ci.timer`.
 
 `systemctl start session-docker-ci` runs it once by hand; `journalctl -u session-docker-ci` has the
-output, and each distro's full build log is in the run directory the output names.  A manual
-`./rebuild-docker-images.py` and the timer share a lock, so neither starts while the other runs.
+output, and each distro's full build log is in the run directory the output names, under
+`/var/log/session-docker-ci` (`logs/` for a manual run); runs older than 30 days are deleted.  A
+manual `./rebuild-docker-images.py` and the timer share a lock, so neither starts while the other
+runs.

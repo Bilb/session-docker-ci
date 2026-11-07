@@ -14,6 +14,7 @@ import hashlib
 import json
 import optparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -24,6 +25,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+
+KEEP_LOGS_DAYS = 30
 
 parser = optparse.OptionParser()
 parser.add_option("--registry", default="reg.session.codes:80",
@@ -36,11 +39,12 @@ parser.add_option("--cache-size", type="int", default=100,
                   help="GB of build cache the builder keeps, when it creates it [default: %default]")
 parser.add_option("--distro", "-d", action="append", default=[],
                   help="Only build this distro, e.g. debian-sid, or one arch of it, e.g. debian-sid/amd64 "
-                       "(repeatable)")
+                       "(repeatable).  The multi-arch tags are only pushed by a run that builds every arch")
 parser.add_option("--debug", action="store_true",
                   help="Show the build output instead of writing it to log files; implies -j1")
 parser.add_option("--arch", default="",
-                  help="Only build these arches, comma separated: amd64,i386,arm64v8,arm32v7")
+                  help="Only build these arches, comma separated: amd64,i386,arm64v8,arm32v7.  The multi-arch "
+                       "tags are only pushed by a run that builds every arch")
 parser.add_option("--parallel", "-j", type="int", default=3,
                   help="Build this many distros at once [default: %default]")
 parser.add_option("--retries", type="int", default=2,
@@ -49,6 +53,9 @@ parser.add_option("--retry-delay", type="int", default=60,
                   help="Seconds before the first retry; doubles on each further retry [default: %default]")
 parser.add_option("--no-push", action="store_true", help="Build only, keeping the result in the build cache")
 parser.add_option("--no-cache", action="store_true", help="Ignore the build cache")
+parser.add_option("--log-dir", default=os.environ.get('LOGS_DIRECTORY', 'logs'),
+                  help="Where each run writes its build logs; runs older than %d days are deleted "
+                       "[default: $LOGS_DIRECTORY, else logs/ next to this script]" % KEEP_LOGS_DAYS)
 parser.add_option("--print", action="store_true", dest="print_only",
                   help="Print the bake definitions and exit")
 (options, args) = parser.parse_args()
@@ -186,7 +193,7 @@ def archive_state(distro):
     return digest.hexdigest()[:16]
 
 
-def image_targets(name, stage, arches, args):
+def image_targets(name, stage, arches, all_arches, args):
     """
     bake targets for one image: X/<arch> for each arch, which CI also uses directly, and the
     multi-arch X.  They share every layer, so BuildKit builds each only once.
@@ -195,6 +202,10 @@ def image_targets(name, stage, arches, args):
     repo = f"{options.registry}/{name}"
     targets = {f"{name}-{a}": {**common, "platforms": [PLATFORMS[a]], "tags": [f"{repo}/{a}"]}
                for a in arches}
+    # CI pulls X on ARM too: a run missing an arch must leave X alone rather than replace it with a
+    # list that lacks that arch.
+    if arches != all_arches:
+        return targets
     if len(arches) == 1:
         targets[f"{name}-{arches[0]}"]["tags"].append(repo)
     else:
@@ -204,19 +215,20 @@ def image_targets(name, stage, arches, args):
 
 def bake_units(distro, arches, state):
     """The distro's bake definitions, in build order: its own images, then each extra unit."""
-    image, suite, _ = DISTROS[distro]
+    image, suite, distro_arches = DISTROS[distro]
     args = {"DISTRO_IMAGE": image, "SESSION_SUITE": suite, "APT_STATE": state}
-    units = [(distro, [(distro + suffix, stage, arches)
+    units = [(distro, [(distro + suffix, stage, distro_arches)
                        for suffix, stage in (('-base', 'base'), ('-builder', 'builder'), ('', 'final'))])]
-    for unit in EXTRAS.get(distro, []):
-        unit = [(name, stage, [a for a in unit_arches if a in arches]) for name, stage, unit_arches in unit]
-        if all(unit_arches for _, _, unit_arches in unit):
-            units.append((unit[0][0], unit))
+    units += [(unit[0][0], unit) for unit in EXTRAS.get(distro, [])]
     definitions = []
     for name, images in units:
+        images = [(image_name, stage, [a for a in all_arches if a in arches], all_arches)
+                  for image_name, stage, all_arches in images]
+        if not all(image_arches for _, _, image_arches, _ in images):
+            continue
         targets = {}
-        for image_name, stage, image_arches in images:
-            targets.update(image_targets(image_name, stage, image_arches, args))
+        for image_name, stage, image_arches, all_arches in images:
+            targets.update(image_targets(image_name, stage, image_arches, all_arches, args))
         definitions.append((name, {"group": {"default": {"targets": list(targets)}}, "target": targets}))
     return definitions
 
@@ -237,7 +249,8 @@ def ensure_builder(rundir):
                         '--driver-opt', 'network=host', '--buildkitd-config', config], check=True)
     out = subprocess.run(['docker', 'buildx', 'inspect', '--bootstrap', options.builder],
                          check=True, capture_output=True, text=True).stdout
-    return {p.strip() for line in out.splitlines() if line.strip().startswith('Platforms:')
+    # A node's platforms set with `buildx create --platform` are printed with a trailing *.
+    return {p.strip().rstrip('*') for line in out.splitlines() if line.strip().startswith('Platforms:')
             for p in line.split(':', 1)[1].split(',')}
 
 
@@ -312,6 +325,16 @@ def failure_report(failures):
     return header if budget < 200 else f"{header}\n```\n{tail[-budget:]}\n```"
 
 
+def new_rundir():
+    """This run's directory for its bake files and logs; deletes runs older than KEEP_LOGS_DAYS."""
+    os.makedirs(options.log_dir, exist_ok=True)
+    for entry in os.scandir(options.log_dir):
+        if entry.is_dir() and entry.name.startswith('run-') \
+                and time.time() - entry.stat().st_mtime > KEEP_LOGS_DAYS * 86400:
+            shutil.rmtree(entry.path, ignore_errors=True)
+    return os.path.abspath(tempfile.mkdtemp(prefix=f"run-{time.strftime('%Y%m%dT%H%M%S')}-", dir=options.log_dir))
+
+
 def main():
     requested = {}  # distro => arches asked for with --distro
     for d in options.distro:
@@ -323,12 +346,12 @@ def main():
     if not set(wanted_arches) <= set(PLATFORMS):
         parser.error(f"--arch takes {', '.join(PLATFORMS)}")
     distros = list(requested) or list(DISTROS)
-    rundir = tempfile.mkdtemp(prefix=f"session-docker-ci-{time.strftime('%Y%m%dT%H%M%S')}-")
 
     failures = []
     if options.print_only:
         supported = set(PLATFORMS.values())
     else:
+        rundir = new_rundir()
         supported = ensure_builder(rundir)
         missing = [a for a in wanted_arches if PLATFORMS[a] not in supported]
         if missing:
@@ -350,6 +373,8 @@ def main():
         return 0
 
     say(f"building {len(plans)} distro(s) for {', '.join(wanted_arches)}; logs in {rundir}")
+    if any(arches != DISTROS[d][2] for d, arches in plans.items()):
+        say("not every arch is built, so the multi-arch tags are left as they are")
     with ThreadPoolExecutor(max_workers=1 if options.debug else max(options.parallel, 1)) as executor:
         results = {d: executor.submit(build_distro, d, arches, rundir) for d, arches in plans.items()}
     for future in results.values():
