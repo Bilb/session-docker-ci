@@ -3,6 +3,43 @@
 
 ARG DISTRO_IMAGE=debian:sid
 ARG APT="apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q"
+ARG CCACHE_VERSION=4.14.2
+ARG CCACHE_SHA256=0feb2707d9cb48885abb950e5d629e85f57fa79a2439cbbdfa681d6c3dc5f0dc
+ARG CCACHE_HELPER_VERSION=0.10.1
+
+
+# ccache, statically linked the way upstream builds its own static releases, so that every image
+# has the same recent version whatever its distro ships, and on i386 and armhf too, which upstream
+# has no binaries for.  CI's shared cache needs ccache 4.13 or later for the storage helper below.
+FROM alpine:3.23 AS ccache
+ARG CCACHE_VERSION
+ARG CCACHE_SHA256
+RUN apk add --no-cache cmake g++ make ninja xxhash-dev zstd-dev zstd-static
+RUN wget -q https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}.tar.xz \
+    && echo "${CCACHE_SHA256}  ccache-${CCACHE_VERSION}.tar.xz" | sha256sum -c - \
+    && tar xf ccache-${CCACHE_VERSION}.tar.xz \
+    && cmake -S ccache-${CCACHE_VERSION} -B build -G Ninja \
+        -D CMAKE_BUILD_TYPE=Release \
+        -D CMAKE_EXE_LINKER_FLAGS_INIT=-static \
+        -D DEPS=DOWNLOAD \
+        -D ENABLE_DOCUMENTATION=OFF \
+        -D ENABLE_TESTING=OFF \
+        -D REDIS_STORAGE_BACKEND=OFF \
+    && cmake --build build \
+    && install -D -s build/ccache /out/ccache
+
+
+# ccache's HTTP storage helper, for https:// remote storage with connections kept open between
+# compiles; ccache runs ccache-storage-<scheme> from next to itself.  Cross-compiled, and go
+# checks the module against the Go checksum database.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS ccache-helper
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG CCACHE_HELPER_VERSION
+RUN GOOS=linux GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} CGO_ENABLED=0 \
+        go install -trimpath -ldflags="-s -w" github.com/ccache/ccache-storage-http-go@v${CCACHE_HELPER_VERSION} \
+    && install -D "$(find /go/bin -type f -name ccache-storage-http-go)" /out/ccache-storage-http \
+    && ln -s ccache-storage-http /out/ccache-storage-https
 
 
 FROM ${DISTRO_IMAGE} AS base
@@ -15,6 +52,12 @@ RUN echo "apt archive state: ${APT_STATE}" \
     && $APT update \
     && $APT dist-upgrade -y \
     && $APT autoremove -y
+COPY --from=ccache /out/ /usr/local/bin/
+COPY --from=ccache-helper /out/ /usr/local/bin/
+# The distro's ccache package, which later stages install, lands beside it as ccache.distrib, so
+# /usr/bin/ccache and the /usr/lib/ccache compiler links run ours.
+RUN dpkg-divert --local --rename --divert /usr/bin/ccache.distrib --add /usr/bin/ccache \
+    && ln -s /usr/local/bin/ccache /usr/bin/ccache
 
 
 # (distro)-builder: the tools for building debs, without what a package's debian/control pulls in.

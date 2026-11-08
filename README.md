@@ -22,6 +22,12 @@ An image is only rebuilt when there is something new to install: the `APT_STATE`
 fingerprint of the Packages indexes of every apt archive its distro installs from, so unchanged
 distros come straight from the build cache.  `--no-cache` rebuilds everything.
 
+Every image except `clone` has the same ccache, built from source as a static binary
+(`CCACHE_VERSION` in the Dockerfile), and its HTTP(S) storage helper (`CCACHE_HELPER_VERSION`), in
+`/usr/local/bin`; `/usr/bin/ccache` points at it, and the distro's own ccache, where a stage
+installs one, is `/usr/bin/ccache.distrib`.  CI's shared compiler cache relies on both.  Bumping
+ccache means updating `CCACHE_SHA256` with the release tarball's checksum.
+
 `./rebuild-docker-images.py --print` shows the bake definitions; `--distro debian-sid` and
 `--arch amd64,i386` narrow a run.  A run that doesn't build every arch of an image pushes only its
 `IMAGE/ARCH` tags and leaves the multi-arch `IMAGE` as it is, since CI pulls that on amd64 and
