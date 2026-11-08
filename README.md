@@ -24,7 +24,8 @@ distros come straight from the build cache.  `--no-cache` rebuilds everything.
 
 `./rebuild-docker-images.py --print` shows the bake definitions; `--distro debian-sid` and
 `--arch amd64,i386` narrow a run.  A run that doesn't build every arch of an image pushes only its
-`IMAGE/ARCH` tags and leaves the multi-arch `IMAGE` as it is, since ARM pipelines pull that too.
+`IMAGE/ARCH` tags and leaves the multi-arch `IMAGE` as it is, since CI pulls that on amd64 and
+arm64.
 
 ### The builder
 
@@ -46,14 +47,17 @@ builder can't build a requested arch, the run builds the others and reports a fa
 to the registry:
 
 1. Copy both units to `/etc/systemd/system/`, set `User=` and `WorkingDirectory=` in the service.
-2. Log that user in to Docker Hub with `docker login` and an access token, stored in
+2. Make sure the builder can build all four arches: qemu, or an ARM node (see above).  CI pulls the
+   multi-arch `IMAGE` tags on amd64 and arm64, and a run that can't build every arch leaves them
+   as they are, so on an amd64-only host the nightly would never refresh what CI uses.
+3. Log that user in to Docker Hub with `docker login` and an access token, stored in
    `~/.docker/config.json` itself rather than a desktop keyring: the timer runs without a login
    session, and anonymous pulls of the base images count against Docker Hub's much lower
    anonymous rate limit.
-3. For failure notifications, create a webhook in the Discord channel (Edit Channel → Integrations
+4. For failure notifications, create a webhook in the Discord channel (Edit Channel → Integrations
    → Webhooks → New Webhook, which needs the Manage Webhooks permission), and put its URL in
    `/etc/session-docker-ci.env` as `DISCORD_WEBHOOK_URL=...`, readable only by root (`chmod 600`).
-4. `systemctl daemon-reload && systemctl enable --now session-docker-ci.timer`.
+5. `systemctl daemon-reload && systemctl enable --now session-docker-ci.timer`.
 
 `systemctl start session-docker-ci` runs it once by hand; `journalctl -u session-docker-ci` has the
 output, and each distro's full build log is in the run directory the output names, under
