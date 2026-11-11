@@ -427,7 +427,7 @@ def ensure_builder(rundir):
         config = os.path.join(rundir, 'buildkitd.toml')
         with open(config, 'w') as f:
             # Explicit, because BuildKit's defaults are shares of the disk: on a mostly full disk it
-            # evicts the cache after every build, and then every run rebuilds everything.
+            # evicts the cache after every build, and an extra then rebuilds the distro it is built on.
             f.write(f'[worker.oci]\n  maxUsedSpace = "{options.cache_size}GB"\n'
                     f'  reservedSpace = "{options.cache_size // 2}GB"\n  minFreeSpace = "10GB"\n')
             if not options.registry_https:

@@ -7,8 +7,8 @@ ARG DISTRO_IMAGE
 
 FROM ${DISTRO_IMAGE} AS base
 ARG APT
-# A fingerprint of the distro's apt archives: this layer, and every image built on it, is rebuilt
-# when the archives have changed and taken from the cache when they have not.
+# One value per run, shared by all its bakes: each run reruns this layer and everything built on it
+# once, and the run's images share the result.
 ARG APT_STATE
 RUN /bin/bash -c 'echo "man-db man-db/auto-update boolean false" | debconf-set-selections'
 RUN echo "apt archive state: ${APT_STATE}" \
