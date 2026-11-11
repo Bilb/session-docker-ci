@@ -66,3 +66,26 @@ built and pushed on every arch (or checked and found current) in `schedule.json`
 `/var/lib/session-docker-ci` for the service, next to the script otherwise.  A run without
 `--scheduled` builds everything it is asked to and leaves the schedule alone.
 
+`systemd/` holds a service and timer that run the rebuild with `--scheduled` every night, on a
+machine that can push to the registry:
+
+1. Copy both units to `/etc/systemd/system/`, set `User=` and `WorkingDirectory=` in the service.
+2. Make sure the builder can build all four arches: qemu, or an ARM node (see above).  CI pulls the
+   multi-arch `IMAGE` tags on amd64 and arm64, and a run that can't build every arch leaves them
+   as they are, so on an amd64-only host the nightly would never refresh what CI uses.
+3. Let the Docker daemon pull from the registry for the apt checks: in `/etc/docker/daemon.json`,
+   `"insecure-registries": ["reg.session.codes:80"]` (the builder has its own copy of this setting).
+4. Log that user in to Docker Hub with `docker login` and an access token, stored in
+   `~/.docker/config.json` itself rather than a desktop keyring: the timer runs without a login
+   session, and anonymous pulls of the base images count against Docker Hub's much lower
+   anonymous rate limit.
+5. For failure notifications, create a webhook in the Discord channel (Edit Channel → Integrations
+   → Webhooks → New Webhook, which needs the Manage Webhooks permission), and put its URL in
+   `/etc/session-docker-ci.env` as `DISCORD_WEBHOOK_URL=...`, readable only by root (`chmod 600`).
+6. `systemctl daemon-reload && systemctl enable --now session-docker-ci.timer`.
+
+`systemctl start session-docker-ci` runs it once by hand; `journalctl -u session-docker-ci` has the
+output, and each distro's full build log is in the run directory the output names, under
+`/var/log/session-docker-ci` (`logs/` for a manual run); runs older than 30 days are deleted.  A
+manual `./rebuild-docker-images.py` and the timer share a lock, so neither starts while the other
+runs.
