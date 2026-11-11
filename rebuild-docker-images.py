@@ -303,7 +303,7 @@ def codename(distro):
     return out.stdout.strip()
 
 
-def image_spec(name, parents, state):
+def image_spec(name, state):
     """bake attributes of one image, without its platforms, tags and output."""
     for distro in DISTROS:
         stage = distro_images(distro).get(name)
@@ -322,7 +322,7 @@ def add_target(targets, target, name, arches, parents, state, tags, output):
     Adds the bake target building image `name`, and the targets its FROM resolves to: a build-only
     copy of the image it is built on, which BuildKit takes from the cache when that image was just built.
     """
-    spec = image_spec(name, parents, state)
+    spec = image_spec(name, state)
     parent = parents.get(name)
     if parent:
         context = f"ctx-{parent}-{'-'.join(arches)}"
