@@ -272,13 +272,34 @@ def fetch(url):
     raise RuntimeError(f"{url}: {error}")
 
 
+def image_id(ref):
+    out = subprocess.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', ref],
+                         capture_output=True, text=True, timeout=60)
+    return out.stdout.strip()
+
+
+def pulling(ref, run):
+    """
+    Calls run(), a `docker run --pull always` of ref.  The pulled image stays in the daemon's store, so
+    the next pull fetches only what changed; the image it replaces is removed, where it would otherwise
+    stay as a dangling image that nothing prunes.
+    """
+    before = image_id(ref)
+    try:
+        return run()
+    finally:
+        after = image_id(ref)
+        if before and after and before != after:
+            subprocess.run(['docker', 'image', 'rm', before], capture_output=True, timeout=300)
+
+
 def codename(distro):
     image, suite, _ = DISTROS[distro]
     if suite != '@SUITE@':
         return suite
-    out = subprocess.run(['docker', 'run', '--rm', '--pull', 'always', image, 'sh', '-c',
-                          '. /etc/os-release && echo "$VERSION_CODENAME"'],
-                         check=True, capture_output=True, text=True, timeout=600)
+    out = pulling(image, lambda: subprocess.run(['docker', 'run', '--rm', '--pull', 'always', image, 'sh', '-c',
+                                                 '. /etc/os-release && echo "$VERSION_CODENAME"'],
+                                                check=True, capture_output=True, text=True, timeout=600))
     return out.stdout.strip()
 
 
@@ -361,10 +382,6 @@ def upgrades_available(image, rundir):
     ref = f"{options.registry}/{image}/amd64"
     out = os.path.join(rundir, 'checks', f"{image}.txt")
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    # The pulled image stays in the daemon's store, so that the next check pulls only what changed; the
-    # one it replaces would otherwise stay as a dangling image, and nothing prunes those.
-    before = subprocess.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', ref],
-                            capture_output=True, text=True, timeout=60).stdout.strip()
     # --entrypoint: clone's is its script.
     cmd = ['docker', 'run', '--rm', '--pull', 'always', '--platform', PLATFORMS['amd64'], '--entrypoint', 'sh',
            ref, '-c', f'{APT} update >/dev/null && {APT} -s dist-upgrade']
@@ -372,13 +389,9 @@ def upgrades_available(image, rundir):
         f.write(f"=== {' '.join(cmd)}\n")
         f.flush()
         try:
-            code = run_stoppable(cmd, options.check_timeout * 60, stdout=f, stderr=subprocess.STDOUT)
+            code = pulling(ref, lambda: run_stoppable(cmd, options.check_timeout * 60, stdout=f, stderr=subprocess.STDOUT))
         except subprocess.TimeoutExpired:
             code = None
-    after = subprocess.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', ref],
-                           capture_output=True, text=True, timeout=60).stdout.strip()
-    if before and after and before != after:
-        subprocess.run(['docker', 'image', 'rm', before], capture_output=True, timeout=300)
     with open(out, errors='replace') as f:
         lines = f.read().splitlines()
     if code != 0:
@@ -553,7 +566,14 @@ def build_distro(distro, arches, rundir, parents, schedule):
             continue
         complete, definition, images = definitions[name]
         if not moving(distro) and not options.no_cache:
-            checks = {image: upgrades_available(image, rundir) for image, _ in images}
+            checks = {}
+            for image, _ in images:
+                if stopping.is_set():
+                    break
+                checks[image] = upgrades_available(image, rundir)
+            if stopping.is_set():
+                failures.append((f"{name} (not built: the run was stopped)", None))
+                continue
             # A failed check still rebuilds, and is reported: a host that can't check (the registry
             # missing from the daemon's insecure-registries, say) would otherwise rebuild everything
             # every night without anyone noticing.
