@@ -1,7 +1,8 @@
 # The mingw cross compiler.
 FROM debian-stable-base
 ARG APT
-RUN $APT install --no-install-recommends -y \
+RUN $APT update \
+    && $APT install --no-install-recommends -y \
         autoconf \
         automake \
         build-essential \
@@ -24,4 +25,5 @@ RUN $APT install --no-install-recommends -y \
         wine \
         zip \
     && update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix \
-    && update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+    && update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix \
+    && rm -rf /var/lib/apt/lists/*

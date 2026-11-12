@@ -36,8 +36,9 @@ parser.add_option("--registry-https", action="store_true",
                   help="The registry speaks HTTPS (by default it is plain HTTP, as ours is over the VPN)")
 parser.add_option("--builder", default="session-ci",
                   help="buildx builder to use, created on first use [default: %default]")
-parser.add_option("--cache-size", type="int", default=100,
-                  help="GB of build cache the builder keeps, when it creates it [default: %default]")
+parser.add_option("--cache-size", type="int", default=150,
+                  help="GB of build cache the builder keeps, when it creates it: it has to hold every image's "
+                       "install layers for a week [default: %default]")
 parser.add_option("--distro", "-d", action="append", default=[],
                   help="Only build this distro, e.g. debian-sid, or one arch of it, e.g. debian-sid/amd64 "
                        "(repeatable).  The multi-arch tags are only pushed by a run that builds every arch")
@@ -118,6 +119,19 @@ def say(message):
 
 
 APT = "apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q"
+# The last layer of every pushed image, on the install layers its Dockerfile builds: the packages
+# that moved since those were built.  Rebuilt on every run, a few MB; the install layers below it
+# keep their digests, so that is all a runner downloads for a refreshed image.  No `${`: bake would
+# interpolate it as its own variable.
+UPGRADE_LAYER = '''FROM pkgs
+ARG APT
+ARG APT_STATE
+RUN echo "apt state: $APT_STATE" \\
+    && $APT update \\
+    && $APT dist-upgrade -y \\
+    && $APT autoremove -y \\
+    && rm -rf /var/lib/apt/lists/*
+'''
 PLATFORMS = {'amd64': 'linux/amd64', 'i386': 'linux/386', 'arm64v8': 'linux/arm64', 'arm32v7': 'linux/arm/v7'}
 DEBIAN_ARCHES = ['amd64', 'arm64v8', 'i386', 'arm32v7']
 UBUNTU_ARCHES = ['amd64', 'arm64v8']
@@ -303,8 +317,8 @@ def codename(distro):
     return out.stdout.strip()
 
 
-def image_spec(name, state):
-    """bake attributes of one image, without its platforms, tags and output."""
+def pkgs_spec(name, parents, pkgs_state):
+    """bake attributes of the build of image `name`'s install layers, without platforms and output."""
     for distro in DISTROS:
         stage = distro_images(distro).get(name)
         if stage:
@@ -312,24 +326,35 @@ def image_spec(name, state):
             # target's, or the extra would rebuild the whole distro from the alias's upstream image.
             image, suite, _ = DISTROS[ALIASES.get(distro, distro)]
             return {"context": ".", "dockerfile": "Dockerfile", "target": stage, "pull": True,
-                    "args": {"APT": APT, "DISTRO_IMAGE": image, "SESSION_SUITE": suite, "APT_STATE": state}}
-    return {"context": ".", "dockerfile": f"images/{name}.Dockerfile", "pull": True,
-            "args": {"APT": APT, "APT_STATE": state}}
+                    "args": {"APT": APT, "DISTRO_IMAGE": image, "SESSION_SUITE": suite, "PKGS_STATE": pkgs_state}}
+    # An extra built on one of ours is rebuilt with it; only one on an upstream image needs the state.
+    args = {"APT": APT} if parents[name] else {"APT": APT, "PKGS_STATE": pkgs_state}
+    return {"context": ".", "dockerfile": f"images/{name}.Dockerfile", "pull": True, "args": args}
+
+
+def pkgs_target(targets, name, arches, parents, pkgs_state):
+    """
+    Adds the build-only target of image `name`'s install layers, on those of the image its FROM
+    names, and returns its name.  Shared by the pushed images built on it, which BuildKit then builds
+    from the cache.
+    """
+    target = f"pkgs-{name}-{'-'.join(arches)}"
+    if target not in targets:
+        spec = pkgs_spec(name, parents, pkgs_state)
+        parent = parents.get(name)
+        if parent:
+            spec["contexts"] = {parent: f"target:{pkgs_target(targets, parent, arches, parents, pkgs_state)}"}
+        targets[target] = {**spec, "platforms": [PLATFORMS[a] for a in arches], "output": ["type=cacheonly"]}
+    return target
 
 
 def add_target(targets, target, name, arches, parents, state, tags, output):
-    """
-    Adds the bake target building image `name`, and the targets its FROM resolves to: a build-only
-    copy of the image it is built on, which BuildKit takes from the cache when that image was just built.
-    """
-    spec = image_spec(name, state)
-    parent = parents.get(name)
-    if parent:
-        context = f"ctx-{parent}-{'-'.join(arches)}"
-        if context not in targets:
-            add_target(targets, context, parent, arches, parents, state, [], ["type=cacheonly"])
-        spec["contexts"] = {parent: f"target:{context}"}
-    targets[target] = {**spec, "platforms": [PLATFORMS[a] for a in arches], "tags": tags, "output": output}
+    """Adds the bake target pushing image `name`: the upgrade layer on its install layers."""
+    pkgs_state, apt_state = state
+    targets[target] = {"context": ".", "dockerfile-inline": UPGRADE_LAYER,
+                       "contexts": {"pkgs": f"target:{pkgs_target(targets, name, arches, parents, pkgs_state)}"},
+                       "args": {"APT": APT, "APT_STATE": apt_state},
+                       "platforms": [PLATFORMS[a] for a in arches], "tags": tags, "output": output}
 
 
 def image_targets(targets, name, arches, all_arches, parents, state):
@@ -414,7 +439,7 @@ def bake_units(distro, arches, state, parents):
         targets = {}
         for image, image_arches, all_arches in images:
             image_targets(targets, image, image_arches, all_arches, parents, state)
-        built = [t for t in targets if not t.startswith('ctx-')]
+        built = [t for t in targets if not t.startswith('pkgs-')]
         complete = all(image_arches == all_arches for _, image_arches, all_arches in images)
         definitions[name] = (complete, {"group": {"default": {"targets": built}}, "target": targets},
                              [(image, image_arches) for image, image_arches, _ in images])
@@ -554,8 +579,9 @@ def build_distro(distro, arches, rundir, parents, schedule):
             say(f"{name}: built {elapsed / 86400:.1f} days ago, refreshed every {days}; skipped")
     if not due or stopping.is_set():
         return [(f"{name} (not built: the run was stopped)", None) for name in due], []
-    # Every bake of this run shares the state, so units rebuilt in it share their layers.
-    state = f"run-{time.strftime('%Y%m%dT%H%M%S')}"
+    # The install layers are rebuilt once a week (the ISO week), the upgrade layer on every run; every
+    # bake of a run shares both values, so the units rebuilt in it share their layers.
+    state = (time.strftime('%G-W%V'), f"run-{time.strftime('%Y%m%dT%H%M%S')}")
     definitions = bake_units(distro, arches, state, parents)
     failures, built = [], []
     for name in due:
@@ -656,7 +682,7 @@ def main():
 
     if options.print_only:
         for d, arches in plans.items():
-            for name, (_, definition, _) in bake_units(d, arches, "<apt state>", parents).items():
+            for name, (_, definition, _) in bake_units(d, arches, ("<pkgs state>", "<apt state>"), parents).items():
                 print(f"# {name}")
                 print(json.dumps(definition, indent=2))
         return 0

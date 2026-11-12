@@ -1,9 +1,9 @@
 # The git clone step CI pipelines use, through gitcache.
 FROM debian:bookworm-slim
 ARG APT
-ARG APT_STATE
+ARG PKGS_STATE
 RUN /bin/bash -c 'echo "man-db man-db/auto-update boolean false" | debconf-set-selections'
-RUN echo "apt archive state: ${APT_STATE}" \
+RUN echo "packages as of ${PKGS_STATE}" \
     && $APT update \
     && $APT dist-upgrade -y \
     && $APT install -y --no-install-recommends git git-lfs python3 python3-pip python3-portalocker python3-pytimeparse python3-coloredlogs bash \
@@ -11,6 +11,6 @@ RUN echo "apt archive state: ${APT_STATE}" \
     && ln -s gitcache /usr/local/bin/git \
     && $APT remove --autoremove --purge -y python3-pip \
     && $APT clean \
-    && rm -rf /var/cache/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 ADD clone-scripts/* /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/clone"]

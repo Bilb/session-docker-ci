@@ -5,7 +5,6 @@ FROM debian-forky-base
 ARG APT
 RUN dpkg --add-architecture s390x \
     && $APT update \
-    && $APT dist-upgrade -y \
     && $APT --no-install-recommends install -y \
         automake \
         build-essential \
@@ -37,4 +36,5 @@ RUN dpkg --add-architecture s390x \
         libutf8proc-dev:s390x \
         libzstd-dev:s390x \
         nettle-dev:s390x \
-        pkgconf:s390x
+        pkgconf:s390x \
+    && rm -rf /var/lib/apt/lists/*

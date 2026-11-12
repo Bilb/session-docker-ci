@@ -1,27 +1,29 @@
-# Every distro's DISTRO-base, DISTRO-builder and DISTRO images, as the stages base, builder and
-# final.  The images built on one of them are in images/.  rebuild-docker-images.py builds both with
-# `docker buildx bake`, and passes the build arguments.
+# Every distro's DISTRO-base, DISTRO-builder and DISTRO images: the stages base, builder and final
+# hold what each one installs.  The images built on one of them are in images/.
+# rebuild-docker-images.py builds both with `docker buildx bake`, passes the build arguments, and
+# adds the layer that upgrades the installed packages on top of every image it pushes.  No stage
+# keeps apt's lists: they are stale by the time an image is used, and every consumer updates them.
 
 ARG DISTRO_IMAGE
 
 
 FROM ${DISTRO_IMAGE} AS base
 ARG APT
-# One value per run, shared by all its bakes: each run reruns this layer and everything built on it
-# once, and the run's images share the result.
-ARG APT_STATE
+# A new value rebuilds every image of the distro from the upstream image, instead of carrying its
+# upgrades in the layer on top; changed once a week, so that layer stays small.
+ARG PKGS_STATE
 RUN /bin/bash -c 'echo "man-db man-db/auto-update boolean false" | debconf-set-selections'
-RUN echo "apt archive state: ${APT_STATE}" \
+RUN echo "packages as of ${PKGS_STATE}" \
     && $APT update \
     && $APT dist-upgrade -y \
-    && $APT autoremove -y
+    && $APT autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 
 # (distro)-builder: the tools for building debs, without what a package's debian/control pulls in.
 FROM base AS builder
 ARG APT
 RUN $APT update \
-    && $APT dist-upgrade -y \
     && $APT --no-install-recommends install -y \
         ccache \
         devscripts \
@@ -29,7 +31,8 @@ RUN $APT update \
         g++ \
         git \
         git-buildpackage \
-        openssh-client
+        openssh-client \
+    && rm -rf /var/lib/apt/lists/*
 
 
 # (distro): the image most builds use, with most dependencies of our packages.
@@ -45,7 +48,6 @@ RUN suite="${SESSION_SUITE}" \
     && printf 'Types: deb\nURIs: https://deb.session.foundation\nSuites: %s\nComponents: main\nSigned-By: /usr/share/keyrings/session-foundation.gpg\n' \
         "$suite" > /etc/apt/sources.list.d/session.sources
 RUN $APT update \
-    && $APT dist-upgrade -y \
     && $APT --no-install-recommends install -y \
         automake \
         ccache \
@@ -115,4 +117,5 @@ RUN $APT update \
         python3-tabulate \
         python3-uwsgidecorators \
         qttools5-dev \
-        sqlite3
+        sqlite3 \
+    && rm -rf /var/lib/apt/lists/*

@@ -3,7 +3,6 @@ FROM debian-testing-base
 ARG APT
 RUN /bin/bash -c 'sed -i "s/main/main non-free/g" /etc/apt/sources.list.d/debian.sources'
 RUN $APT update \
-    && $APT dist-upgrade -y \
     && $APT install --no-install-recommends -y \
         android-sdk \
         automake \
@@ -26,4 +25,4 @@ RUN $APT update \
     && update-java-alternatives -s java-1.21.0-openjdk-amd64 \
     && git clone https://github.com/Shadowstyler/android-sdk-licenses.git /tmp/android-sdk-licenses \
     && cp -a /tmp/android-sdk-licenses/*-license /usr/lib/android-sdk/licenses \
-    && rm -rf /tmp/android-sdk-licenses
+    && rm -rf /tmp/android-sdk-licenses /var/lib/apt/lists/*

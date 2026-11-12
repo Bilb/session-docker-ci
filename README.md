@@ -36,6 +36,14 @@ testing's images, and those built on them, are rebuilt on every run: some packag
 every day.  An image that can't be checked (not pushed yet, registry unreachable) is rebuilt.
 `--no-cache` rebuilds everything without checking.
 
+A rebuild is cheap for the runners: every pushed image is the install layers its Dockerfile builds
+plus one layer on top that upgrades what moved since (`UPGRADE_LAYER` in the script).  The install
+layers are built once a week (a new `PKGS_STATE`, the ISO week) and otherwise come from the
+builder's cache with their digests unchanged, so a nightly refresh pushes, and a runner pulls, only
+the top layer: the upgraded packages, a few MB on most nights.  The weekly rebuild keeps that layer
+from growing, and takes in the upstream `debian:*`/`ubuntu:*` image's own refresh.  No image keeps
+apt's lists; a consumer runs `apt-get update` before installing, as every CI pipeline does.
+
 `./rebuild-docker-images.py --print` shows the bake definitions; `--distro debian-sid` and
 `--arch amd64,i386` narrow a run.  A run that doesn't build every arch of an image pushes only its
 `IMAGE/ARCH` tags and leaves the multi-arch `IMAGE` as it is, since CI pulls that on amd64 and
@@ -44,7 +52,8 @@ arm64.
 ### The builder
 
 The script creates a buildx builder (`session-ci`, using the `docker-container` driver) on first
-use, configured for the registry's plain HTTP.  On its own it builds the host's platforms (amd64 and
+use, configured for the registry's plain HTTP and with `--cache-size` (150 GB) of build cache, which
+has to hold a week of every image's install layers.  On its own it builds the host's platforms (amd64 and
 i386 on an x86 host).  The ARM images need either qemu (`apt install qemu-user-static
 binfmt-support`), or, much faster, a native ARM machine added as a node:
 
