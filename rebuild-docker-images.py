@@ -121,15 +121,16 @@ def say(message):
 APT = "apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q"
 # The last layer of every pushed image, on the install layers its Dockerfile builds: the packages
 # that moved since those were built.  Rebuilt on every run, a few MB; the install layers below it
-# keep their digests, so that is all a runner downloads for a refreshed image.  No `${`: bake would
-# interpolate it as its own variable.
+# keep their digests, so that is all a runner downloads for a refreshed image.  Nothing runs after
+# it to notice a package it removed, so a removal (a transition apt can only resolve by dropping
+# something, which a dist-upgrade may do) fails the build instead; the weekly rebuild of the install
+# layers takes the transition in.  No `${`: bake would interpolate it as its own variable.
 UPGRADE_LAYER = '''FROM pkgs
 ARG APT
 ARG APT_STATE
 RUN echo "apt state: $APT_STATE" \\
     && $APT update \\
-    && $APT dist-upgrade -y \\
-    && $APT autoremove -y \\
+    && $APT --no-remove dist-upgrade -y \\
     && rm -rf /var/lib/apt/lists/*
 '''
 PLATFORMS = {'amd64': 'linux/amd64', 'i386': 'linux/386', 'arm64v8': 'linux/arm64', 'arm32v7': 'linux/arm/v7'}
