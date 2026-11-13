@@ -30,7 +30,8 @@ today), whose images are pushed under both names.  Its images then carry the rel
 their apt sources, not the alias.
 
 An image is only rebuilt when apt would upgrade something in it.  For each image of a released
-distro, the run pulls the image CI uses (`IMAGE/amd64`, standing for every arch) and asks its own apt
+distro, the run pulls the image CI uses (the multi-arch `IMAGE`, on amd64, standing for every arch;
+that tag exists only when every arch was pushed) and asks its own apt
 with `apt-get -s dist-upgrade`; nothing to upgrade means the image is left as it is.  sid's and
 testing's images, and those built on them, are rebuilt on every run: some package of theirs changes
 every day.  An image that can't be checked (not pushed yet, registry unreachable) is rebuilt.

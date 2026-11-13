@@ -407,12 +407,14 @@ def unit_plan(distro, parents):
 def upgrades_available(image, rundir):
     """
     The packages apt would upgrade in the pushed image, as its `apt-get -s dist-upgrade` reports: the
-    same apt, sources and pins the image's own build uses.  amd64 stands for every arch: the archives
+    same apt, sources and pins the image's own build uses.  The multi-arch tag's amd64 image: that tag
+    is pushed only when every arch built, where IMAGE/amd64 is pushed on its own and would read as
+    current after a night whose ARM or i386 build failed.  amd64 stands for every arch: the archives
     move together, and an arch-specific update is caught the next time anything else moves.  Returns
     (what, problem): the packages, or why the image is treated as behind instead, and the check's log
     when it failed for a reason worth reporting (not for an image that isn't pushed yet).
     """
-    ref = f"{options.registry}/{image}/amd64"
+    ref = f"{options.registry}/{image}"
     out = os.path.join(rundir, 'checks', f"{image}.txt")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     # --entrypoint: clone's is its script.
