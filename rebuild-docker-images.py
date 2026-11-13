@@ -118,7 +118,9 @@ def say(message):
         print(f"[{time.time() - started:6.0f}s] {message}", flush=True)
 
 
-APT = "apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -q"
+# Error-Mode: by default `update` exits 0 with a mirror unreachable, and the dry-run upgrade on the
+# old lists then reads as nothing to upgrade.
+APT = "apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -o=APT::Update::Error-Mode=any -q"
 # The last layer of every pushed image, on the install layers its Dockerfile builds: the packages
 # that moved since those were built.  Rebuilt on every run, a few MB; the install layers below it
 # keep their digests, so that is all a runner downloads for a refreshed image.  Nothing runs after
