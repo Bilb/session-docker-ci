@@ -44,7 +44,10 @@ the top layer: the upgraded packages, a few MB on most nights.  An upgrade that 
 the Dockerfile named (or, on Ubuntu, one of the base image's own) fails the build instead, so a
 pushed image always has everything it asked for.  The weekly rebuild keeps that layer from growing,
 takes in the upstream `debian:*`/`ubuntu:*` image's own refresh, and absorbs a transition that
-needs such a removal.  No image keeps
+needs such a removal.  When the week's install layers fail to build (a package uninstallable that
+day), the unit is built once more on the last pushed week's, still in the builder's cache, so the
+image is refreshed all the same; the run reports the failed rebuild each night until it succeeds.
+No image keeps
 apt's lists; a consumer runs `apt-get update` before installing, as every CI pipeline does.
 
 `./rebuild-docker-images.py --print` shows the bake definitions; `--distro debian-sid` and

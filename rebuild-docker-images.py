@@ -514,8 +514,10 @@ def run_stoppable(cmd, timeout, **kwargs):
                 running.discard(process)
 
 
-def run_bake(name, definition, rundir):
+def run_bake(name, definition, rundir, retries=None):
     """Runs one bake, with retries.  Returns None on success, else its log."""
+    if retries is None:
+        retries = options.retries
     bakefile = os.path.join(rundir, f"{name}.bake.json")
     with open(bakefile, 'w') as f:
         json.dump(definition, f, indent=2)
@@ -523,7 +525,7 @@ def run_bake(name, definition, rundir):
     cmd = ['docker', 'buildx', 'bake', '--builder', options.builder, '--file', bakefile, '--progress', 'plain',
            *(['--no-cache'] if options.no_cache else [])]
     began = time.time()
-    for attempt in range(options.retries + 1):
+    for attempt in range(retries + 1):
         if attempt:
             delay = options.retry_delay * 2 ** (attempt - 1)
             say(f"{name}: failed, retrying in {delay}s (see {log})")
@@ -624,10 +626,30 @@ def build_distro(distro, arches, rundir, parents, schedule):
         # context, so it fails only if those are what broke.
         log = run_bake(name, definition, rundir)
         if log is not None:
+            week = fallback_week(name, state[0], schedule)
+            if week and not stopping.is_set():
+                say(f"{name}: trying {week}'s install layers with tonight's upgrade")
+                _, definition, _ = bake_units(distro, arches, (week, state[1]), parents)[name]
+                if run_bake(f"{name}-{week}", definition, rundir, retries=0) is None:
+                    failures.append((f"{name}: this week's install layers failed, pushed {week}'s "
+                                     "with tonight's upgrade instead", log))
+                    continue
             failures.append((name, log))
             continue
         built += [name] if complete and not options.no_push else []
     return failures, built
+
+
+def fallback_week(name, week, schedule):
+    """
+    The install layers to build a unit on when this week's fail (a package uninstallable today): the
+    week it was last pushed, whose layers are still in the builder's cache, so only the upgrade layer
+    builds.  None when that is this week: the failure is elsewhere.  The fallback is not recorded as
+    a push, so the next run tries this week's layers again.
+    """
+    last = schedule.get(name, time.time() - 7 * 86400)
+    last = time.strftime('%G-W%V', time.localtime(last))
+    return last if last != week else None
 
 
 def failure_report(failures):
