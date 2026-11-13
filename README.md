@@ -63,9 +63,20 @@ binfmt-support`), or, much faster, a native ARM machine added as a node:
     docker buildx create --append --name session-ci --platform linux/arm64,linux/arm/v7 \
         --buildkitd-config buildkitd.toml ssh://user@arm-host
 
-where `buildkitd.toml` holds the same `[registry."reg.session.codes:80"] http = true` section the
-script writes.  Each node pushes its own images, so the ARM host needs the VPN too.  When the
-builder can't build a requested arch, the run builds the others and reports a failure.
+where `buildkitd.toml` holds both sections the script writes for its own node.  Without the first,
+the node keeps BuildKit's default share of its disk, evicts the install layers midweek, and the ARM
+runners pull whole images again:
+
+    [worker.oci]
+      maxUsedSpace = "150GB"
+      reservedSpace = "75GB"
+      minFreeSpace = "10GB"
+    [registry."reg.session.codes:80"]
+      http = true
+      insecure = true
+
+Each node pushes its own images, so the ARM host needs the VPN too.  When the builder can't build a
+requested arch, the run builds the others and reports a failure.
 
 ### Nightly rebuilds
 
