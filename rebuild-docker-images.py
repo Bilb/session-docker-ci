@@ -124,10 +124,10 @@ APT = "apt-get -o=Dpkg::Use-Pty=0 -o=Acquire::Retries=5 -o=APT::Update::Error-Mo
 # The last layer of every pushed image, on the install layers its Dockerfile builds: the packages
 # that moved since those were built.  Rebuilt on every run, a few MB; the install layers below it
 # keep their digests, so that is all a runner downloads for a refreshed image.  Nothing runs after
-# it to notice a package it removed, so it fails if a package a Dockerfile named (apt's manual
-# set; the upstream image marks none) is gone after the upgrade: a transition apt can only resolve
-# by dropping one waits for the weekly rebuild of the install layers.  No `${`: bake would
-# interpolate it as its own variable.
+# it to notice a package it removed, so it fails if a package a Dockerfile named is gone after the
+# upgrade (apt's manual set: Debian's images mark none of their own, Ubuntu's mark all, so there
+# the base packages are covered too).  A transition apt can only resolve by dropping one waits for
+# the weekly rebuild of the install layers.  No `${`: bake would interpolate it as its own variable.
 UPGRADE_LAYER = '''FROM pkgs
 ARG APT
 ARG APT_STATE

@@ -41,9 +41,10 @@ plus one layer on top that upgrades what moved since (`UPGRADE_LAYER` in the scr
 layers are built once a week (a new `PKGS_STATE`, the ISO week) and otherwise come from the
 builder's cache with their digests unchanged, so a nightly refresh pushes, and a runner pulls, only
 the top layer: the upgraded packages, a few MB on most nights.  An upgrade that removes a package
-the Dockerfile named fails the build instead, so a pushed image always has everything it asked
-for.  The weekly rebuild keeps that layer from growing, takes in the upstream `debian:*`/`ubuntu:*`
-image's own refresh, and absorbs a transition that needs such a removal.  No image keeps
+the Dockerfile named (or, on Ubuntu, one of the base image's own) fails the build instead, so a
+pushed image always has everything it asked for.  The weekly rebuild keeps that layer from growing,
+takes in the upstream `debian:*`/`ubuntu:*` image's own refresh, and absorbs a transition that
+needs such a removal.  No image keeps
 apt's lists; a consumer runs `apt-get update` before installing, as every CI pipeline does.
 
 `./rebuild-docker-images.py --print` shows the bake definitions; `--distro debian-sid` and
